@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from opm_mcp.wsl import to_wsl_path, to_windows_path
@@ -42,6 +44,7 @@ def test_unc_localhost_form_also_works() -> None:
     assert to_wsl_path(inp) == "/home/me/case.DATA"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="to_windows_path is a no-op on POSIX hosts by design")
 def test_to_windows_path_round_trip_for_mnt() -> None:
     win = r"C:\Users\me\case.DATA"
     assert to_windows_path(to_wsl_path(win)) == win
