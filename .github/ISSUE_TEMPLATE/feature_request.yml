@@ -1,0 +1,23 @@
+name: Feature request
+description: A new tool, integration, or workflow.
+title: "[feat] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: What workflow are you trying to enable?
+      placeholder: |
+        I want Claude to do X with my Y deck so I can Z without leaving chat.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed tool / change
+      description: Tool name, signature, what it returns.
+      render: python
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

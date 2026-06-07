@@ -1,0 +1,45 @@
+name: Bug report
+description: A tool failed, returned wrong output, or hung.
+title: "[bug] "
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Which MCP tool did you call, with which arguments?
+      placeholder: |
+        Tool: run_flow
+        Args: { "deck_path": "C:\\models\\NORNE\\NORNE_ATW2013.DATA" }
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Paste the output of the `opm_environment` tool.
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: opm-mcp-version
+    attributes:
+      label: opm-mcp version
+      placeholder: "0.1.0"
+  - type: input
+    id: wsl-distro
+    attributes:
+      label: WSL distro
+      placeholder: "Ubuntu-24.04"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Tail of the flow.log file or any traceback.
+      render: text

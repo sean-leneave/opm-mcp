@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opm-mcp"
+version = "0.1.0"
+description = "MCP server bridging Claude to OPM Flow, OPM Upscaling and ResInsight (Linux binaries under WSL, server on Windows)."
+requires-python = ">=3.11"
+authors = [{ name = "ogezi" }]
+license = { text = "MIT" }
+readme = "README.md"
+dependencies = [
+    "mcp[cli]>=1.2",
+    "resdata>=4.2",
+    "pydantic>=2.6",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+opm-mcp = "opm_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+opm_mcp = ["helpers/*.py"]

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "opm": {
+      "command": "py",
+      "args": ["-m", "opm_mcp.server"],
+      "env": {
+        "OPM_MCP_WSL_DISTRO": "Ubuntu-24.04",
+        "OPM_MCP_FLOW_THREADS": "0",
+        "OPM_MCP_LOG_TAIL": "200"
+      }
+    }
+  }
+}

@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# OPM MCP server work directory (jobs + artifacts)
+.opm-mcp/
+
+# Local config overrides
+.env
+.env.local
+
+# OPM / ECLIPSE result files anywhere in tree (these can be huge)
+*.UNSMRY
+*.UNRST
+*.EGRID
+*.INIT
+*.SMSPEC
+*.PRT
+*.DBG
+*.RFT
+*.S[0-9][0-9][0-9][0-9]
+*.X[0-9][0-9][0-9][0-9]
+*.FUNRST
+*.FUNSMRY
+
+# But keep the example deck and small sample data
+!examples/**/*.DATA
+!examples/**/*.INC
+
+# Third-party example decks (Equinor opm-tests, ODbL) - not redistributed.
+# Pull them directly from https://github.com/OPM/opm-tests if you need them.
+examples/Gaslift/
+examples/norne/
+examples/spe9/
+examples/spe10/
