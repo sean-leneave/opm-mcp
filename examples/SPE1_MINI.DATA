@@ -33,6 +33,10 @@ UNIFOUT
 
 GRID
 
+-- Request the INIT file so static props (PORO/PERM/PORV) are written; this
+-- also enables pore-volume-weighted averages in restart_property / grid_info.
+INIT
+
 DXV
   5*1000 /
 DYV

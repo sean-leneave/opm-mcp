@@ -26,13 +26,17 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .config import SETTINGS
 
 _DRIVE_LETTER_RE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
-_WSL_MNT_RE = re.compile(r"^/mnt/([a-z])/(.*)$")
 _WSL_UNC_RE = re.compile(r"^[\\/]{2}wsl(?:\$|\.localhost)[\\/]([^\\/]+)[\\/](.*)$", re.IGNORECASE)
+
+# WSL's DrvFs mount root for Windows drives. Default is ``/mnt/`` but users can
+# set ``automount.root=/`` in /etc/wsl.conf (giving ``/c/...``). Detected once
+# via ``wslpath`` and cached so we don't hardcode the wrong prefix.
+_mount_prefix_cache: str | None = None
 
 
 class WSLError(RuntimeError):
@@ -64,10 +68,38 @@ def _wsl_exe() -> str:
     return exe
 
 
+def _mount_prefix() -> str:
+    """Return the WSL mount root for Windows drives, e.g. ``/mnt/`` or ``/``.
+
+    Detected once via ``wslpath -u 'C:/'`` and cached. Falls back to ``/mnt/``
+    if WSL is unreachable. This keeps path translation correct even when the
+    distro sets a non-default ``automount.root``.
+    """
+    global _mount_prefix_cache
+    if _mount_prefix_cache is not None:
+        return _mount_prefix_cache
+    prefix = "/mnt/"
+    try:
+        res = run(["wslpath", "-u", "C:/"], check=False, timeout=10)
+        out = res.stdout.strip()
+        m = re.match(r"^(/.*?/)c/?$", out) or re.match(r"^(/)c/?$", out)
+        if m:
+            prefix = m.group(1)
+    except Exception:
+        pass
+    _mount_prefix_cache = prefix
+    return prefix
+
+
+def _wsl_mnt_re() -> re.Pattern[str]:
+    root = re.escape(_mount_prefix().rstrip("/"))
+    return re.compile(rf"^{root}/([a-z])/(.*)$")
+
+
 def to_wsl_path(path: str | Path) -> str:
     """Convert a Windows path to its equivalent inside the WSL distro.
 
-    - ``C:\\Users\\me`` → ``/mnt/c/Users/me``
+    - ``C:\\Users\\me`` → ``/mnt/c/Users/me`` (or the distro's mount root)
     - ``\\\\wsl$\\Ubuntu-24.04\\home\\me`` → ``/home/me``
     - Already-Linux paths (``/foo/bar``) pass through unchanged.
     """
@@ -81,7 +113,7 @@ def to_wsl_path(path: str | Path) -> str:
     drive = _DRIVE_LETTER_RE.match(raw)
     if drive:
         letter, rest = drive.group(1).lower(), drive.group(2).replace("\\", "/")
-        return f"/mnt/{letter}/{rest}"
+        return f"{_mount_prefix()}{letter}/{rest}"
     # Looks already-POSIX.
     if raw.startswith("/"):
         return raw
@@ -94,7 +126,7 @@ def to_wsl_path(path: str | Path) -> str:
 def to_windows_path(path: str) -> str:
     """Convert a WSL path back to its Windows equivalent (best effort)."""
     raw = str(path).strip()
-    mnt = _WSL_MNT_RE.match(raw)
+    mnt = _wsl_mnt_re().match(raw)
     if mnt:
         letter, rest = mnt.group(1).upper(), mnt.group(2).replace("/", "\\")
         return f"{letter}:\\{rest}"
@@ -145,11 +177,20 @@ def popen(
     env: Mapping[str, str] | None = None,
     stdout_path: str | Path | None = None,
     stderr_path: str | Path | None = None,
+    merge_stderr: bool = False,
 ) -> subprocess.Popen:
-    """Spawn a background WSL process, optionally redirecting output to files."""
+    """Spawn a background WSL process, optionally redirecting output to files.
+
+    ``merge_stderr=True`` folds stderr into the stdout stream (the moral
+    equivalent of ``2>&1``), so a single capture file holds both — no second
+    file handle fighting over the same offset.
+    """
     cmd = _build_command(argv, cwd=cwd, env=env)
     stdout = open(stdout_path, "wb") if stdout_path else subprocess.PIPE
-    stderr = open(stderr_path, "wb") if stderr_path else subprocess.PIPE
+    if merge_stderr:
+        stderr: Any = subprocess.STDOUT
+    else:
+        stderr = open(stderr_path, "wb") if stderr_path else subprocess.PIPE
     creationflags = 0
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
@@ -160,6 +201,27 @@ def popen(
         stdin=subprocess.DEVNULL,
         creationflags=creationflags,
     )
+
+
+def wsl_pid_alive(pid: int) -> bool:
+    """Return True if a Linux PID is still alive inside the distro."""
+    res = run(
+        ["bash", "-lc", f"kill -0 {int(pid)} 2>/dev/null && echo 1 || echo 0"],
+        check=False,
+        timeout=10,
+    )
+    return res.stdout.strip().endswith("1")
+
+
+def wsl_kill(pid: int, *, force: bool = False) -> bool:
+    """Send SIGTERM (or SIGKILL) to a Linux PID inside the distro."""
+    sig = "-9" if force else "-15"
+    res = run(
+        ["bash", "-lc", f"kill {sig} {int(pid)} 2>/dev/null && echo 1 || echo 0"],
+        check=False,
+        timeout=10,
+    )
+    return res.stdout.strip().endswith("1")
 
 
 def _build_command(

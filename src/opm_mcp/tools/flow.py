@@ -16,6 +16,7 @@ def run_flow(
     extra_args: list[str] | None = None,
     output_dir: str | None = None,
     threads: int | None = None,
+    convergence_info: str | None = "steps,iterations",
 ) -> dict[str, Any]:
     """Start a Flow simulation in the background.
 
@@ -31,6 +32,10 @@ def run_flow(
         the server work dir.
     threads : int | None
         Convenience for ``--threads-per-process``.
+    convergence_info : str | None
+        ``--output-extra-convergence-info`` value. Defaults to
+        ``"steps,iterations"`` so ``flow_convergence_report`` has data. Set to
+        ``"none"`` to skip the extra diagnostic files.
 
     Returns
     -------
@@ -44,13 +49,17 @@ def run_flow(
         extra_args=extra_args,
         output_dir=output_dir,
         threads=threads,
+        convergence_info=convergence_info,
     )
     return {
         "job_id": job.job_id,
         "pid": job.pid,
+        "wsl_pid": job.wsl_pid,
         "case_name": job.case_name,
         "log_path": job.log_path,
-        "output_dir_wsl": f"{job.workdir_wsl}/out" if output_dir is None else wsl.to_wsl_path(output_dir),
+        "output_dir_wsl": job.output_dir_wsl,
+        "output_dir_win": wsl.to_windows_path(job.output_dir_wsl),
+        "case_prefix_win": f"{wsl.to_windows_path(job.output_dir_wsl)}\\{job.case_name}",
         "state": job.state,
         "started_at": job.started_at,
         "argv": job.argv,
@@ -60,10 +69,12 @@ def run_flow(
 def flow_status(job_id: str) -> dict[str, Any]:
     """Return the current state of a Flow job, including the latest progress line."""
     job = jobs.get_job(job_id)
+    out_win = wsl.to_windows_path(job.output_dir_wsl) if job.output_dir_wsl else f"{job.workdir_win}\\out"
     return {
         "job_id": job.job_id,
         "state": job.state,
         "pid": job.pid,
+        "wsl_pid": job.wsl_pid,
         "returncode": job.returncode,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
@@ -71,7 +82,8 @@ def flow_status(job_id: str) -> dict[str, Any]:
         "last_progress": job.last_progress,
         "error": job.error,
         "log_path": job.log_path,
-        "output_dir": f"{job.workdir_win}\\out",
+        "output_dir": out_win,
+        "case_prefix_win": f"{out_win}\\{job.case_name}",
     }
 
 

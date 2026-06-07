@@ -18,8 +18,11 @@ from mcp.server.fastmcp import FastMCP
 
 from . import wsl
 from .config import SETTINGS
+from .tools import analysis as analysis_tools
 from .tools import deck as deck_tools
+from .tools import edit as edit_tools
 from .tools import flow as flow_tools
+from .tools import plots as plot_tools
 from .tools import resinsight as ri_tools
 from .tools import results as result_tools
 from .tools import utils as util_tools
@@ -32,6 +35,10 @@ mcp = FastMCP(
         "reading UNSMRY/UNRST/EGRID/INIT result files, driving ResInsight for "
         "snapshots and well logs, and OPM utility binaries (convertECL, "
         "compareECL, opmpack, opmhash, summary, optional opm-upscaling). "
+        "Also: native matplotlib plots (no GL), material-balance and solver-"
+        "convergence diagnostics, per-layer restart-property stats, and a "
+        "deck editor for sensitivities. For PVT/SCAL/relperm calculations, "
+        "defer to the pyrestoolbox MCP if present. "
         "Linux binaries run inside a WSL2 distro; the server itself runs on Windows."
     ),
 )
@@ -101,9 +108,20 @@ def run_flow(
     extra_args: list[str] | None = None,
     output_dir: str | None = None,
     threads: int | None = None,
+    convergence_info: str | None = "steps,iterations",
 ) -> dict[str, Any]:
-    """Start an OPM Flow simulation in the background. Returns a job id immediately."""
-    return flow_tools.run_flow(deck_path, extra_args=extra_args, output_dir=output_dir, threads=threads)
+    """Start an OPM Flow simulation in the background. Returns a job id immediately.
+
+    By default writes INFOSTEP/INFOITER diagnostics so ``flow_convergence_report``
+    works; pass ``convergence_info="none"`` to skip them.
+    """
+    return flow_tools.run_flow(
+        deck_path,
+        extra_args=extra_args,
+        output_dir=output_dir,
+        threads=threads,
+        convergence_info=convergence_info,
+    )
 
 
 @mcp.tool()
@@ -181,6 +199,99 @@ def restart_info(case_path: str) -> dict[str, Any]:
 def compare_summaries(case_a: str, case_b: str, keys: list[str] | None = None) -> dict[str, Any]:
     """Compare two cases on field totals (or supplied keys). Default = FOPT/FGPT/FWPT/FPR."""
     return result_tools.compare_summaries(case_a, case_b, keys=keys)
+
+
+# ---------------------------------------------------------------------------
+# Native plotting (matplotlib — no ResInsight/OpenGL)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def plot_summary(
+    case_path: str,
+    keys: list[str],
+    output_path: str | None = None,
+    title: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    x_axis: str = "date",
+    max_points: int = 1000,
+    twin_axis: bool = True,
+) -> dict[str, Any]:
+    """Plot summary vectors to a PNG (twin-axis by unit). Returns the image path.
+
+    No ResInsight/OpenGL needed — the fast path for rate/pressure/cumulative
+    line plots. ``x_axis`` is ``"date"`` or ``"days"``.
+    """
+    return plot_tools.plot_summary(
+        case_path,
+        keys,
+        output_path=output_path,
+        title=title,
+        start=start,
+        end=end,
+        x_axis=x_axis,
+        max_points=max_points,
+        twin_axis=twin_axis,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reservoir-engineering analytics
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def material_balance_check(case_path: str) -> dict[str, Any]:
+    """Field MB QC: OOIP, recovery factor, exact oil mass-balance drift, surface VRR."""
+    return analysis_tools.material_balance_check(case_path)
+
+
+@mcp.tool()
+def flow_convergence_report(case_path: str, worst_n: int = 5) -> dict[str, Any]:
+    """Solver performance from INFOSTEP/INFOITER: time by stage, wasted steps, worst steps."""
+    return analysis_tools.flow_convergence_report(case_path, worst_n=worst_n)
+
+
+@mcp.tool()
+def restart_property(
+    case_path: str,
+    keyword: str = "PRESSURE",
+    report_step: int | None = None,
+    n_histogram_bins: int = 10,
+) -> dict[str, Any]:
+    """Per-layer stats for a dynamic property (PRESSURE/SWAT/SGAS/SOIL) at a report step."""
+    return analysis_tools.restart_property(
+        case_path, keyword=keyword, report_step=report_step, n_histogram_bins=n_histogram_bins
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deck editing (sensitivities / history matching)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def clone_deck(
+    deck_path: str,
+    output_path: str | None = None,
+    overrides: list[dict] | None = None,
+    flatten_includes: bool = False,
+    validate: bool = True,
+) -> dict[str, Any]:
+    """Clone a deck with safe text overrides (append_before_end / replace_regex / set_title / insert_after_keyword).
+
+    Writes a NEW deck, reports per-op substitution counts, and re-validates.
+    Idiomatic rate/BHP change: append a new WCONPROD/WCONINJE via
+    ``append_before_end`` (last control in SCHEDULE wins).
+    """
+    return edit_tools.clone_deck(
+        deck_path,
+        output_path=output_path,
+        overrides=overrides,
+        flatten_includes=flatten_includes,
+        validate=validate,
+    )
 
 
 # ---------------------------------------------------------------------------

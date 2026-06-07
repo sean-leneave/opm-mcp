@@ -137,12 +137,36 @@ your `mcpServers` block:
 | Tool                     | Purpose                                                |
 | ------------------------ | ------------------------------------------------------ |
 | `list_summary_vectors`   | All summary keys (FOPR, WBHP:*, GOPR:*, ...).          |
-| `read_summary`           | Time series for one or more keys, downsampled.         |
-| `field_summary`          | Cumulative production/injection, FPR, final rates.     |
+| `read_summary`           | Time series for one or more keys, with per-vector units + elapsed days, downsampled. |
+| `field_summary`          | Cumulative production/injection, FPR, final rates (with units). |
 | `well_summary`           | Per-well WOPR/WGPR/WWPR/WBHP/WOPT/etc. min/max/last.   |
 | `grid_info`              | EGRID dims, active count, INIT property stats.         |
 | `restart_info`           | UNRST report step list + keywords.                     |
 | `compare_summaries`      | Diff field totals between two cases.                   |
+
+### Native plotting (matplotlib — no ResInsight/OpenGL)
+
+| Tool            | Purpose                                                                |
+| --------------- | --------------------------------------------------------------------- |
+| `plot_summary`  | Render summary vectors to a PNG, auto twin-axis by unit, date or days x-axis. The fast path for rate/pressure/cumulative plots. |
+
+### Reservoir-engineering analytics
+
+| Tool                       | Purpose                                                              |
+| -------------------------- | ------------------------------------------------------------------- |
+| `material_balance_check`   | OOIP, recovery factor, **exact** oil mass-balance drift, surface VRR. |
+| `flow_convergence_report`  | Parse INFOSTEP/INFOITER: wall time by stage, wasted (cut) steps, worst timesteps, residuals. |
+| `restart_property`         | Per-layer stats (PV-weighted when INIT present) for PRESSURE/SWAT/SGAS/SOIL at a report step, plus histogram. |
+
+> For PVT, SCAL/relative-permeability fitting and deck-physics validation, this
+> server defers to the **[pyrestoolbox MCP](https://github.com/whitsonAS)** if
+> you have it connected, rather than duplicating those calculators.
+
+### Deck editing (sensitivities / history matching)
+
+| Tool         | Purpose                                                                       |
+| ------------ | ---------------------------------------------------------------------------- |
+| `clone_deck` | Write a NEW deck with safe overrides (`append_before_end`, `replace_regex`, `set_title`, `insert_after_keyword`), reporting per-op substitution counts and re-validating. Enables clone → run → compare loops. |
 
 ### ResInsight automation (CLI command files)
 
@@ -209,13 +233,16 @@ opm-mcp/
   src/opm_mcp/
     __init__.py
     config.py            # env-var driven settings
-    wsl.py               # WSL bridge + path translation
-    jobs.py              # background flow-job tracker
+    wsl.py               # WSL bridge + path translation (wslpath-aware)
+    jobs.py              # background flow-job tracker (restart-safe)
     server.py            # FastMCP entry point (`opm-mcp` script)
     tools/
       deck.py            # validate / summarise / wells
       flow.py            # run, status, log_tail, cancel, jobs
-      results.py         # resdata-backed summary/grid/restart readers
+      results.py         # resdata-backed summary/grid/restart readers (units + cache)
+      plots.py           # native matplotlib plot_summary
+      analysis.py        # material balance, convergence report, restart property
+      edit.py            # clone_deck with safe overrides
       resinsight.py      # snapshot, well log, interactive open
       utils.py           # opmpack, opmhash, summary, compareECL, upscaling
     helpers/
@@ -228,8 +255,11 @@ opm-mcp/
   WSL-style (`/mnt/c/foo`, `/home/...`); the server normalises both directions.
   Result-file tools accept either the bare case name (`SPE1_MINI`) or any of
   its known extensions (`.DATA`, `.SMSPEC`, `.EGRID`, `.UNRST`).
-- **Background simulations.** `run_flow` returns immediately. The job persists
-  metadata under `OPM_MCP_WORK_DIR/jobs/<id>/` so logs survive server restarts.
+- **Background simulations.** `run_flow` returns immediately and writes its
+  Linux PID + exit code under `OPM_MCP_WORK_DIR/jobs/<id>/`. Jobs are
+  **rehydrated on server restart**, so you can still poll (and cancel, via
+  `wsl kill`) a run that was started before Claude Desktop restarted. Runs also
+  emit INFOSTEP/INFOITER by default for `flow_convergence_report`.
 - **Optional upscaling.** The `opm-upscaling` Debian package is *not* a
   dependency of Flow; `upscaling_status` tells Claude whether it's available
   and prints the install command if not.

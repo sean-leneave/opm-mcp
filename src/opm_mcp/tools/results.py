@@ -7,7 +7,7 @@ normalised to a Windows path before resdata is asked to open them.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -33,11 +33,33 @@ def _case_root(path: str) -> Path:
     return p
 
 
+def _iso(dt64: np.datetime64) -> str:
+    """ISO-8601 string from a numpy datetime64 (timezone-aware UTC)."""
+    secs = dt64.astype("datetime64[s]").astype(int)
+    return datetime.fromtimestamp(int(secs), tz=timezone.utc).replace(tzinfo=None).isoformat()
+
+
+# Small mtime-keyed cache so repeated reads of the same case in one session
+# (read_summary -> field_summary -> plot_summary -> material_balance) don't
+# re-parse the SMSPEC each time. Norne has ~10k vectors; this matters.
+_SUMMARY_CACHE: dict[str, tuple[float, Any]] = {}
+
+
 def _open_summary(path: str):
     from resdata.summary import Summary  # local import keeps server startup fast
 
     root = str(_case_root(path))
-    return Summary(root)
+    smspec = Path(root + ".SMSPEC")
+    try:
+        mtime = smspec.stat().st_mtime
+    except OSError:
+        mtime = -1.0
+    cached = _SUMMARY_CACHE.get(root)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    summary = Summary(root)
+    _SUMMARY_CACHE[root] = (mtime, summary)
+    return summary
 
 
 def list_summary_vectors(case_path: str, pattern: str | None = None, limit: int = 200) -> dict[str, Any]:
@@ -103,16 +125,27 @@ def read_summary(
         idx = idx[np.linspace(0, len(idx) - 1, max_points).astype(int)]
 
     vectors = {k: summary.numpy_vector(k)[idx].tolist() for k in requested}
+    units = {k: _unit_of(summary, k) for k in requested}
     unit_system = getattr(summary, "unit_system", None)
     return {
         "ok": True,
         "case_path": str(_case_root(case_path)),
         "unit_system": str(unit_system) if unit_system is not None else "unknown",
-        "time": [datetime.utcfromtimestamp(d.astype("datetime64[s]").astype(int)).isoformat() for d in dates[idx]],
+        "units": units,
+        "time": [_iso(d) for d in dates[idx]],
+        "days": np.asarray(summary.days)[idx].tolist() if hasattr(summary, "days") else None,
         "vectors": vectors,
         "missing": missing,
         "n_points": len(idx),
     }
+
+
+def _unit_of(summary, key: str) -> str | None:
+    """Per-vector engineering unit (e.g. STB/DAY, PSIA, MSCF/DAY)."""
+    try:
+        return summary.unit(key)
+    except Exception:
+        return None
 
 
 def field_summary(case_path: str) -> dict[str, Any]:
@@ -135,11 +168,16 @@ def field_summary(case_path: str) -> dict[str, Any]:
         if k in available:
             arr = summary.numpy_vector(k)
             if arr.size:
-                out[k] = {"label": label, "first": float(arr[0]), "last": float(arr[-1])}
+                out[k] = {
+                    "label": label,
+                    "unit": _unit_of(summary, k),
+                    "first": float(arr[0]),
+                    "last": float(arr[-1]),
+                }
     dates = summary.numpy_dates
     if len(dates):
-        out["t0"] = datetime.utcfromtimestamp(dates[0].astype("datetime64[s]").astype(int)).isoformat()
-        out["t_end"] = datetime.utcfromtimestamp(dates[-1].astype("datetime64[s]").astype(int)).isoformat()
+        out["t0"] = _iso(dates[0])
+        out["t_end"] = _iso(dates[-1])
         out["n_report_steps"] = int(len(dates))
     return out
 
@@ -155,6 +193,7 @@ def well_summary(case_path: str, well: str) -> dict[str, Any]:
             arr = summary.numpy_vector(key)
             if arr.size:
                 out["metrics"][tag] = {
+                    "unit": _unit_of(summary, key),
                     "first": float(arr[0]),
                     "last": float(arr[-1]),
                     "min": float(arr.min()),
