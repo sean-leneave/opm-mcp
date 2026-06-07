@@ -21,12 +21,15 @@ land therefore needs:
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Mapping, Sequence
+
+_ON_WINDOWS = os.name == "nt"
 
 from .config import SETTINGS
 
@@ -117,15 +120,22 @@ def to_wsl_path(path: str | Path) -> str:
     # Looks already-POSIX.
     if raw.startswith("/"):
         return raw
-    # Bare relative path (e.g. "deck.DATA") — resolve against CWD on Windows
-    # and recurse, so the WSL side sees an absolute path.
-    abs_path = str(PureWindowsPath(Path(raw).resolve()))
-    return to_wsl_path(abs_path)
+    # Bare relative path. On Windows resolve against CWD then re-translate the
+    # drive path; on a POSIX host it is already a native path.
+    if _ON_WINDOWS:
+        return to_wsl_path(str(PureWindowsPath(Path(raw).resolve())))
+    return str(Path(raw).resolve())
 
 
 def to_windows_path(path: str) -> str:
-    """Convert a WSL path back to its Windows equivalent (best effort)."""
+    """Convert a WSL path back to its Windows equivalent (best effort).
+
+    On a non-Windows host (e.g. CI, or a future native-Linux backend) there is
+    nothing to translate — a ``/`` path is already local — so we pass it through.
+    """
     raw = str(path).strip()
+    if not _ON_WINDOWS:
+        return raw
     mnt = _wsl_mnt_re().match(raw)
     if mnt:
         letter, rest = mnt.group(1).upper(), mnt.group(2).replace("/", "\\")

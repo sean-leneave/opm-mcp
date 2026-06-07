@@ -49,3 +49,12 @@ def test_to_windows_path_round_trip_for_mnt() -> None:
 
 def test_empty_string_passes_through() -> None:
     assert to_wsl_path("") == ""
+
+
+def test_to_windows_path_is_noop_on_posix_host(monkeypatch) -> None:
+    """On a non-Windows host (CI, native-Linux backend) '/' paths are local."""
+    import opm_mcp.wsl as wslmod
+
+    monkeypatch.setattr(wslmod, "_ON_WINDOWS", False)
+    assert wslmod.to_windows_path("/tmp/case/CASE.DATA") == "/tmp/case/CASE.DATA"
+
