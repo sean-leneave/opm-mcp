@@ -8,10 +8,16 @@
 A Model Context Protocol (MCP) server that gives Claude direct access to the
 [Open Porous Media](https://opm-project.org/) reservoir-simulation stack:
 
-- **OPM Flow** — black-oil and compositional reservoir simulator (ECLIPSE-compatible).
+- **OPM Flow** — black-oil and compositional reservoir simulator
+  (ECLIPSE-compatible), from [OPM/opm-simulators](https://github.com/OPM/opm-simulators).
 - **ResInsight** — 3D viewer and post-processor.
 - **OPM utility binaries** — `opmpack`, `opmhash`, `summary`, `convertECL`, `compareECL`.
 - **OPM upscaling** (optional `opm-upscaling` package).
+
+> `flow` and its Python bindings (`python3-opm-simulators`) are built from the
+> [OPM/opm-simulators](https://github.com/OPM/opm-simulators) repository — see it
+> for the simulator source, supported keywords, build instructions, and issue
+> tracker.
 
 The server runs **on Windows** so Claude Code / Claude Desktop can spawn it
 natively, but it delegates every Linux-only binary to an Ubuntu distro under
@@ -50,6 +56,13 @@ sudo apt-get install opm-upscaling
 # Optional, for fully headless ResInsight rendering without WSLg:
 sudo apt-get install xvfb mesa-utils libgl1-mesa-dri
 ```
+
+The `flow` simulator comes from
+[OPM/opm-simulators](https://github.com/OPM/opm-simulators). The `apt` packages
+above track upstream releases; to run a development build or a specific version,
+follow the [build instructions](https://github.com/OPM/opm-simulators#building-opm)
+there and point the server at it with `OPM_MCP_FLOW_BIN` (see
+[Configuration](#configuration-env-vars)).
 
 ## Install
 
@@ -271,6 +284,10 @@ opm-mcp/
 ## Acknowledgements
 
 - [Open Porous Media](https://opm-project.org/) — the underlying reservoir-simulation stack.
+- [OPM/opm-simulators](https://github.com/OPM/opm-simulators) — OPM Flow, the
+  reservoir simulator (and its Python bindings) this server drives.
+- [OPM/opm-common](https://github.com/OPM/opm-common) — deck parsing, ECL I/O,
+  and the utility binaries (`opmpack`, `convertECL`, `summary`, …).
 - [Equinor `resdata`](https://github.com/equinor/resdata) — open-source ECL result-file reader.
 - [Model Context Protocol](https://modelcontextprotocol.io/) and the
   [official Python SDK](https://github.com/modelcontextprotocol/python-sdk).
