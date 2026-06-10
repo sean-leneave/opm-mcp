@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import os
-from pathlib import Path
 
 
 def test_settings_defaults(tmp_path, monkeypatch):

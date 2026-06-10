@@ -29,6 +29,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
+      - name: Lint (ruff)
+        run: ruff check src tests
+
       - name: Import smoke test
         run: |
           python -c "from opm_mcp import server; print('tools:', len([t for t in dir(server) if not t.startswith('_')]))"

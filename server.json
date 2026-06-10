@@ -1,0 +1,34 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.ojaogezi/opm-mcp",
+  "description": "Reservoir engineering MCP server for the OPM stack: run OPM Flow simulations, read ECLIPSE result files, plot and map results, QC material balance and solver convergence, build restart decks, and drive ResInsight.",
+  "repository": {
+    "url": "https://github.com/ojaogezi/opm-mcp",
+    "source": "github"
+  },
+  "version": "0.2.0",
+  "packages": [
+    {
+      "registry_type": "pypi",
+      "identifier": "opm-mcp",
+      "version": "0.2.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environment_variables": [
+        {
+          "name": "OPM_MCP_WSL_DISTRO",
+          "description": "WSL distro with OPM installed (Windows hosts only).",
+          "is_required": false,
+          "default": "Ubuntu-24.04"
+        },
+        {
+          "name": "OPM_MCP_MAX_PARALLEL",
+          "description": "Maximum concurrent flow simulations.",
+          "is_required": false,
+          "default": "2"
+        }
+      ]
+    }
+  ]
+}

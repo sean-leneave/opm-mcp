@@ -258,7 +258,6 @@ def restart_property(
     Returns overall stats, a per-K-layer table (pore-volume-weighted mean when
     INIT/PORV is available, else cell-count mean), and a coarse histogram.
     """
-    from resdata.grid import Grid
     from resdata.resfile import ResdataFile
 
     root = _results._case_root(case_path)
@@ -294,7 +293,7 @@ def restart_property(
             "ok": False,
             "error": f"grid/property size mismatch ({k_index.size} vs {values.size})",
         }
-    porv = _porv_array(str(root), values.size)
+    porv = _porv_array(str(root), str(egrid), values.size)
 
     nz = int(k_index.max()) + 1 if k_index.size else 0
     layers = []
@@ -352,16 +351,40 @@ def _restart_array(f, kw: str, step_index: int) -> np.ndarray:
 
 
 @lru_cache(maxsize=8)
-def _k_index_array(egrid_path: str) -> np.ndarray:
-    """K-layer index (0-based) per active cell. Cached per grid."""
+def _grid_geometry(egrid_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[int, int, int]]:
+    """Per-active-cell ``(i, j, k, global_index)`` arrays + ``(nx, ny, nz)``.
+
+    One cached pass over the grid serves layer bucketing (k), map rendering
+    (i, j) and global→active compression (global_index) alike.
+    """
     from resdata.grid import Grid
 
     g = Grid(egrid_path)
     n = g.get_num_active()
-    return np.fromiter((g.get_ijk(active_index=a)[2] for a in range(n)), dtype=np.int32, count=n)
+    iarr = np.empty(n, dtype=np.int32)
+    jarr = np.empty(n, dtype=np.int32)
+    karr = np.empty(n, dtype=np.int32)
+    gidx = np.empty(n, dtype=np.int64)
+    for a in range(n):
+        i, j, k = g.get_ijk(active_index=a)
+        iarr[a], jarr[a], karr[a] = i, j, k
+        gidx[a] = g.get_global_index(active_index=a)
+    return iarr, jarr, karr, gidx, (g.get_nx(), g.get_ny(), g.get_nz())
 
 
-def _porv_array(root: str, n_active: int) -> np.ndarray | None:
+def _k_index_array(egrid_path: str) -> np.ndarray:
+    """K-layer index (0-based) per active cell."""
+    return _grid_geometry(egrid_path)[2]
+
+
+def _porv_array(root: str, egrid_path: str, n_active: int) -> np.ndarray | None:
+    """Active-cell pore volumes from INIT, or None if unavailable.
+
+    PORV is the one INIT keyword written at **global** grid size (inactive
+    cells hold zeros) — every real field model with inactive cells hits this,
+    so compress global→active via the grid index map rather than silently
+    dropping the weighting.
+    """
     from resdata.resfile import ResdataFile
 
     init = Path(root + ".INIT")
@@ -372,13 +395,170 @@ def _porv_array(root: str, n_active: int) -> np.ndarray | None:
         if "PORV" not in fi:
             return None
         porv = np.array(fi["PORV"][0])
-        # PORV is over all cells; keep only the active ones if needed.
         if porv.size == n_active:
             return porv
-        # Fall back: cannot align — skip weighting.
+        _, _, _, gidx, (nx, ny, nz) = _grid_geometry(egrid_path)
+        if porv.size == nx * ny * nz:
+            return porv[gidx]
         return None
     except OSError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Observed-vs-simulated (history-match QC)
+# ---------------------------------------------------------------------------
+
+
+def compare_to_observed(
+    case_path: str,
+    observed_csv: str,
+    keys: list[str] | None = None,
+    plot: bool = True,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Compare simulated summary vectors against observed data and quantify misfit.
+
+    CSV layout: first column is the date (ISO ``YYYY-MM-DD``; ``DD.MM.YYYY``,
+    ``MM/DD/YYYY``, ``DD-Mon-YYYY`` also accepted), remaining headers are
+    summary keys (``WBHP:PROD``, ``FOPR``, ...). Blank cells are skipped, so
+    sparse observations are fine. Simulated values are interpolated to the
+    observation times; misfit is reported per key (n, RMSE, bias, MAE, NRMSE)
+    and optionally plotted (sim line + obs markers, one panel per key).
+    """
+    import csv as _csv
+
+    path = _results._to_local(observed_csv)
+    if not path.exists():
+        return {"ok": False, "error": f"observed CSV not found: {path}"}
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        rows = [r for r in _csv.reader(fh) if any(cell.strip() for cell in r)]
+    if len(rows) < 2:
+        return {"ok": False, "error": "CSV needs a header row plus at least one data row"}
+    headers = [h.strip() for h in rows[0]]
+    obs_keys = headers[1:]
+    if keys:
+        wanted_set = {k.upper() for k in keys}
+        obs_keys = [k for k in obs_keys if k.upper() in wanted_set]
+    if not obs_keys:
+        return {"ok": False, "error": "no observed columns match the requested keys", "csv_columns": headers[1:]}
+
+    obs_dates: list[Any] = []
+    obs_cols: dict[str, list[float | None]] = {k: [] for k in obs_keys}
+    for r in rows[1:]:
+        try:
+            obs_dates.append(_parse_obs_date(r[0]))
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        for k in obs_keys:
+            idx = headers.index(k)
+            cell = r[idx].strip() if idx < len(r) else ""
+            obs_cols[k].append(float(cell) if cell else None)
+
+    summary = _results._open_summary(case_path)
+    available = set(summary.keys())
+    days = np.asarray(summary.days, dtype=float)
+    dates = np.asarray(summary.numpy_dates)
+    # Summary "days" are elapsed since simulation start; anchor obs dates there.
+    start = dates[0] - np.timedelta64(int(round(days[0] * 86400)), "s")
+    obs_days = np.array(
+        [(np.datetime64(d) - start) / np.timedelta64(1, "s") / 86400.0 for d in obs_dates]
+    )
+
+    metrics: dict[str, Any] = {}
+    series: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    missing: list[str] = []
+    for k in obs_keys:
+        if k not in available:
+            missing.append(k)
+            continue
+        vals = obs_cols[k]
+        mask = np.array([v is not None for v in vals])
+        if not mask.any():
+            continue
+        t = obs_days[mask]
+        o = np.array([v for v in vals if v is not None], dtype=float)
+        sim_vec = summary.numpy_vector(k)
+        s = np.interp(t, days, sim_vec)
+        resid = s - o
+        span = float(o.max() - o.min())
+        denom = span if span > 0 else max(abs(float(o.mean())), 1e-12)
+        n_outside = int(((t < days[0]) | (t > days[-1])).sum())
+        metrics[k] = {
+            "n_obs": int(o.size),
+            "rmse": float(np.sqrt(np.mean(resid**2))),
+            "bias_sim_minus_obs": float(resid.mean()),
+            "mae": float(np.abs(resid).mean()),
+            "nrmse": float(np.sqrt(np.mean(resid**2)) / denom),
+            "unit": _results._unit_of(summary, k),
+            "n_obs_outside_sim_window": n_outside,
+        }
+        series[k] = (t, o, sim_vec)
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "case_path": str(_results._case_root(case_path)),
+        "observed_csv": str(path),
+        "metrics": metrics,
+        "missing_in_summary": missing,
+    }
+    if plot and series:
+        out["png_path"] = _plot_obs_panels(case_path, days, series, output_path)
+    return out
+
+
+def _parse_obs_date(raw: str):
+    from datetime import datetime as _dt
+
+    s = raw.strip()
+    try:
+        return _dt.fromisoformat(s)
+    except ValueError:
+        pass
+    for fmt in ("%d.%m.%Y", "%m/%d/%Y", "%d-%b-%Y", "%Y%m%d"):
+        try:
+            return _dt.strptime(s, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"unparseable date {raw!r} (use ISO YYYY-MM-DD)")
+
+
+def _plot_obs_panels(case_path, sim_days, series, output_path: str | None) -> str:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from ..config import SETTINGS
+
+    keys = list(series)[:6]
+    n = len(keys)
+    ncols = 2 if n > 1 else 1
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.0 * ncols, 3.4 * nrows), squeeze=False)
+    case_name = Path(str(_results._case_root(case_path))).name
+    fig.suptitle(f"{case_name}: simulated vs observed", fontsize=12)
+    for ax, k in zip(axes.flat, keys):
+        t, o, sim_vec = series[k]
+        ax.plot(sim_days, sim_vec, "-", lw=1.4, label="sim")
+        ax.plot(t, o, "o", ms=4, mfc="none", label="obs")
+        ax.set_title(k, fontsize=10, loc="left")
+        ax.set_xlabel("Elapsed time (days)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+    for ax in axes.flat[n:]:
+        ax.axis("off")
+    if output_path:
+        png = Path(output_path)
+        png.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        d = SETTINGS.work_dir / "artifacts" / "plots"
+        d.mkdir(parents=True, exist_ok=True)
+        png = d / f"{case_name}_obs_compare.png"
+    fig.tight_layout()
+    fig.savefig(png, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return str(png)
 
 
 # ---------------------------------------------------------------------------

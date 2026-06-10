@@ -19,10 +19,11 @@ A Model Context Protocol (MCP) server that gives Claude direct access to the
 > for the simulator source, supported keywords, build instructions, and issue
 > tracker.
 
-The server runs **on Windows** so Claude Code / Claude Desktop can spawn it
-natively, but it delegates every Linux-only binary to an Ubuntu distro under
-WSL2. Result files (UNSMRY / UNRST / EGRID / INIT) are parsed natively on
-Windows via [`resdata`](https://github.com/equinor/resdata).
+On **Windows** the server runs natively (so Claude Code / Claude Desktop can
+spawn it) and delegates every Linux-only binary to an Ubuntu distro under WSL2.
+On **native Linux** the same package runs the OPM binaries directly — no WSL
+involved. Result files (UNSMRY / UNRST / EGRID / INIT / RFT) are parsed
+in-process via [`resdata`](https://github.com/equinor/resdata) either way.
 
 ## Architecture
 
@@ -116,6 +117,7 @@ your `mcpServers` block:
 | `OPM_MCP_FLOW_THREADS`    | `0` (auto)           | `--threads-per-process` default for runs.      |
 | `OPM_MCP_JOB_HISTORY`     | `50`                 | How many recent jobs to remember in-memory.    |
 | `OPM_MCP_LOG_TAIL`        | `200`                | Default line count for `flow_log_tail`.        |
+| `OPM_MCP_MAX_PARALLEL`    | `2`                  | Max concurrent Flow runs; extra submissions queue. |
 
 ## Tool reference
 
@@ -123,7 +125,8 @@ your `mcpServers` block:
 
 | Tool              | Purpose                                                            |
 | ----------------- | ------------------------------------------------------------------ |
-| `opm_environment` | Probe `wsl.exe`, `flow`, `ResInsight`, OPM Python bindings.        |
+| `opm_environment` | Probe backend mode (WSL / native Linux), `flow`, `ResInsight`, OPM Python bindings. |
+| `list_cases`      | Scan a directory tree for decks/results — the session opener.      |
 | `to_wsl_path`     | Translate `C:\foo\bar` to `/mnt/c/foo/bar`.                        |
 | `to_windows_path` | Reverse translation.                                               |
 
@@ -139,10 +142,10 @@ your `mcpServers` block:
 
 | Tool             | Purpose                                                              |
 | ---------------- | -------------------------------------------------------------------- |
-| `run_flow`       | Start a Flow job; returns a `job_id` immediately.                    |
-| `flow_status`    | Current state + last progress line (`Report step N/M ...`).          |
+| `run_flow`       | Start a Flow job; returns a `job_id` immediately. Queues (`state="queued"`) past `OPM_MCP_MAX_PARALLEL`; `mpi_processes=N` runs `mpirun -np N`. |
+| `flow_status`    | Current state, queue position, last progress line, provenance (flow version + deck SHA-256). |
 | `flow_log_tail`  | Tail of combined stdout/stderr.                                      |
-| `flow_cancel`    | Cancel a running job.                                                |
+| `flow_cancel`    | Cancel a running or queued job (works across server restarts).       |
 | `flow_jobs`      | List recent jobs (most recent first).                                |
 
 ### Result readers (native Windows via `resdata`)
@@ -159,9 +162,12 @@ your `mcpServers` block:
 
 ### Native plotting (matplotlib — no ResInsight/OpenGL)
 
-| Tool            | Purpose                                                                |
-| --------------- | --------------------------------------------------------------------- |
-| `plot_summary`  | Render summary vectors to a PNG, auto twin-axis by unit, date or days x-axis. The fast path for rate/pressure/cumulative plots. |
+Plots return MCP **image content**, so they render directly in the chat.
+
+| Tool                | Purpose                                                            |
+| ------------------- | ------------------------------------------------------------------ |
+| `plot_summary`      | Summary vectors to PNG; **wildcards** (`WWCT:*`), auto twin-axis by unit, date or days x-axis. |
+| `plot_property_map` | I–J areal map of a layer property — dynamic (PRESSURE/SWAT/SGAS/SOIL from UNRST) or static (PORO/PERMX/NTG from INIT). |
 
 ### Reservoir-engineering analytics
 
@@ -169,7 +175,9 @@ your `mcpServers` block:
 | -------------------------- | ------------------------------------------------------------------- |
 | `material_balance_check`   | OOIP, recovery factor, **exact** oil mass-balance drift, surface VRR. |
 | `flow_convergence_report`  | Parse INFOSTEP/INFOITER: wall time by stage, wasted (cut) steps, worst timesteps, residuals. |
-| `restart_property`         | Per-layer stats (PV-weighted when INIT present) for PRESSURE/SWAT/SGAS/SOIL at a report step, plus histogram. |
+| `restart_property`         | Per-layer stats (PV-weighted, also on grids with inactive cells) for PRESSURE/SWAT/SGAS/SOIL at a report step, plus histogram. |
+| `compare_to_observed`      | History-match QC: RMSE/bias/MAE/NRMSE of sim vs an observations CSV, with overlay plot. |
+| `rft_data`                 | RFT pressure-vs-depth surveys per well/date (needs `WRFTPLT` in the deck). |
 
 > For PVT, SCAL/relative-permeability fitting and deck-physics validation, this
 > server defers to the **[pyrestoolbox MCP](https://github.com/whitsonAS)** if
@@ -198,6 +206,7 @@ If ResInsight fails with `MESA: error: ZINK ...`, pass
 | -------------------- | ------------------------------------------------------------- |
 | `convert_ecl`        | Toggle formatted/unformatted ECL output files.                |
 | `compare_ecl`        | Diff two result files within tolerances.                      |
+| `make_restart_deck`  | History→prediction deck via `rst_deck` (auto-adds `UNIFIN` for unified restarts). |
 | `pack_deck`          | Flatten a deck + INCLUDEs into one file (`opmpack`).          |
 | `hash_deck`          | Keyword-level deterministic hash (`opmhash`).                 |
 | `summary_tool`       | Text summary table via the OPM `summary` CLI.                 |

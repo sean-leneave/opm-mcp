@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from .. import jobs, wsl
+from ..config import SETTINGS
 
 
 def run_flow(
@@ -17,6 +18,7 @@ def run_flow(
     output_dir: str | None = None,
     threads: int | None = None,
     convergence_info: str | None = "steps,iterations",
+    mpi_processes: int | None = None,
 ) -> dict[str, Any]:
     """Start a Flow simulation in the background.
 
@@ -36,13 +38,15 @@ def run_flow(
         ``--output-extra-convergence-info`` value. Defaults to
         ``"steps,iterations"`` so ``flow_convergence_report`` has data. Set to
         ``"none"`` to skip the extra diagnostic files.
+    mpi_processes : int | None
+        Run distributed via ``mpirun -np N`` (per-rank ``threads`` still apply).
 
     Returns
     -------
     dict
-        ``job_id``, ``pid``, ``log_path``, ``output_dir`` and the resolved
-        argv. Poll :func:`flow_status` with the ``job_id`` until ``state`` is no
-        longer ``"running"``.
+        ``job_id``, ``state`` (``"running"`` or ``"queued"`` when all
+        ``OPM_MCP_MAX_PARALLEL`` slots are busy), paths, and the resolved argv.
+        Poll :func:`flow_status` with the ``job_id`` until ``state`` is terminal.
     """
     job = jobs.start_flow_job(
         deck_path,
@@ -50,7 +54,10 @@ def run_flow(
         output_dir=output_dir,
         threads=threads,
         convergence_info=convergence_info,
+        mpi_processes=mpi_processes,
     )
+    out_win = wsl.to_windows_path(job.output_dir_wsl)
+    sep = "\\" if "\\" in out_win or ":" in out_win else "/"
     return {
         "job_id": job.job_id,
         "pid": job.pid,
@@ -58,10 +65,13 @@ def run_flow(
         "case_name": job.case_name,
         "log_path": job.log_path,
         "output_dir_wsl": job.output_dir_wsl,
-        "output_dir_win": wsl.to_windows_path(job.output_dir_wsl),
-        "case_prefix_win": f"{wsl.to_windows_path(job.output_dir_wsl)}\\{job.case_name}",
+        "output_dir_win": out_win,
+        "case_prefix_win": f"{out_win}{sep}{job.case_name}",
         "state": job.state,
+        "queue_position": jobs.queue_position(job),
+        "created_at": job.created_at,
         "started_at": job.started_at,
+        "deck_sha256": job.deck_sha256,
         "argv": job.argv,
     }
 
@@ -70,12 +80,15 @@ def flow_status(job_id: str) -> dict[str, Any]:
     """Return the current state of a Flow job, including the latest progress line."""
     job = jobs.get_job(job_id)
     out_win = wsl.to_windows_path(job.output_dir_wsl) if job.output_dir_wsl else f"{job.workdir_win}\\out"
+    sep = "\\" if "\\" in out_win or ":" in out_win else "/"
     return {
         "job_id": job.job_id,
         "state": job.state,
+        "queue_position": jobs.queue_position(job),
         "pid": job.pid,
         "wsl_pid": job.wsl_pid,
         "returncode": job.returncode,
+        "created_at": job.created_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
         "case_name": job.case_name,
@@ -83,7 +96,9 @@ def flow_status(job_id: str) -> dict[str, Any]:
         "error": job.error,
         "log_path": job.log_path,
         "output_dir": out_win,
-        "case_prefix_win": f"{out_win}\\{job.case_name}",
+        "case_prefix_win": f"{out_win}{sep}{job.case_name}",
+        "flow_version": job.flow_version,
+        "deck_sha256": job.deck_sha256,
     }
 
 
@@ -107,15 +122,17 @@ def flow_cancel(job_id: str) -> dict[str, Any]:
 def flow_jobs() -> dict[str, Any]:
     """List recent Flow jobs known to this server (most recent first)."""
     return {
+        "max_parallel": SETTINGS.max_parallel,
         "jobs": [
             {
                 "job_id": j.job_id,
                 "state": j.state,
                 "case_name": j.case_name,
+                "created_at": j.created_at,
                 "started_at": j.started_at,
                 "finished_at": j.finished_at,
                 "returncode": j.returncode,
             }
             for j in jobs.list_jobs()
-        ]
+        ],
     }

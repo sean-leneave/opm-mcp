@@ -94,6 +94,10 @@ def plot_summary(
     plotted = list(vectors.keys())
     if not plotted:
         return {"ok": False, "error": "no plottable vectors", "missing": data.get("missing")}
+    note = None
+    if len(plotted) > 12:
+        note = f"{len(plotted)} vectors matched; plotting the first 12 (refine the pattern for others)"
+        plotted = plotted[:12]
 
     if x_axis == "days" and data.get("days") is not None:
         x = data["days"]
@@ -171,6 +175,134 @@ def plot_summary(
         "n_points": data.get("n_points"),
         "x_axis": "days" if not x_is_date else "date",
         "missing": data.get("missing"),
+        "note": note,
+    }
+
+
+def plot_property_map(
+    case_path: str,
+    keyword: str = "SWAT",
+    k_layer: int = 1,
+    report_step: int | None = None,
+    output_path: str | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> dict[str, Any]:
+    """Render an I–J areal map of a grid property for one K layer as a PNG.
+
+    Dynamic properties (``PRESSURE``, ``SWAT``, ``SGAS``, derived ``SOIL``)
+    come from the UNRST at ``report_step`` (default: last); static properties
+    (``PORO``, ``PERMX``, ``NTG``, ``PORV``, ...) fall back to the INIT file.
+    Inactive cells render blank. Axes are 1-based I (x) and J (y, J=1 at top),
+    matching deck conventions. No ResInsight/OpenGL involved.
+    """
+    import numpy as np
+    from resdata.resfile import ResdataFile
+
+    from . import analysis as _analysis
+
+    root = _results._case_root(case_path)
+    egrid = Path(str(root) + ".EGRID")
+    if not egrid.exists():
+        return {"ok": False, "error": f"EGRID not found: {egrid}"}
+    kw = keyword.upper()
+
+    values = None
+    source = None
+    step_used = None
+    unrst = Path(str(root) + ".UNRST")
+    if unrst.exists():
+        f = ResdataFile(str(unrst))
+        seq = [int(f["SEQNUM"][i][0]) for i in range(f.num_named_kw("SEQNUM"))]
+        if seq and (kw in f or kw == "SOIL"):
+            step_used = seq[-1] if report_step is None else report_step
+            if step_used not in seq:
+                return {"ok": False, "error": f"report step {step_used} not in {seq}"}
+            try:
+                values = _analysis._restart_array(f, kw, seq.index(step_used))
+                source = "UNRST"
+            except KeyError:
+                values = None
+    iarr, jarr, karr, gidx, (nx, ny, nz) = _analysis._grid_geometry(str(egrid))
+    if values is None:
+        init = Path(str(root) + ".INIT")
+        if init.exists():
+            fi = ResdataFile(str(init))
+            if kw in fi:
+                arr = np.array(fi[kw][0])
+                if arr.size == iarr.size:
+                    values = arr
+                elif arr.size == nx * ny * nz:
+                    values = arr[gidx]  # PORV is global-size; compress to active
+                source = "INIT" if values is not None else None
+                step_used = None
+    if values is None:
+        return {
+            "ok": False,
+            "error": f"{kw} not found in UNRST or INIT for this case",
+            "hint": "dynamic: PRESSURE/SWAT/SGAS/SOIL; static: PORO/PERMX/NTG/...",
+        }
+
+    if not 1 <= k_layer <= nz:
+        return {"ok": False, "error": f"k_layer {k_layer} outside 1..{nz}"}
+    mask = karr == (k_layer - 1)
+    if not mask.any():
+        return {"ok": False, "error": f"no active cells in layer {k_layer}"}
+    grid2d = np.full((ny, nx), np.nan)
+    grid2d[jarr[mask], iarr[mask]] = values[mask]
+    layer_vals = values[mask]
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if kw in {"SWAT", "SGAS", "SOIL"} and vmin is None and vmax is None:
+        vmin, vmax = 0.0, 1.0
+    fig, ax = plt.subplots(figsize=(9, 7))
+    im = ax.imshow(
+        grid2d,
+        origin="upper",
+        aspect="equal",
+        cmap="viridis",
+        vmin=vmin,
+        vmax=vmax,
+        extent=(0.5, nx + 0.5, ny + 0.5, 0.5),
+        interpolation="nearest",
+    )
+    case_name = Path(str(root)).name
+    when = f" @ report step {step_used}" if step_used is not None else " (static)"
+    ax.set_title(f"{case_name}: {kw}, layer K={k_layer}{when}", fontsize=11)
+    ax.set_xlabel("I")
+    ax.set_ylabel("J")
+    fig.colorbar(im, ax=ax, label=kw, shrink=0.85)
+
+    if output_path and str(output_path).lower().endswith(".png"):
+        from .. import wsl
+
+        raw = output_path if not output_path.startswith("/") else wsl.to_windows_path(output_path)
+        png = Path(raw)
+        png.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        png = _artifact_dir(output_path) / f"{case_name}_{kw}_K{k_layer}.png"
+    fig.tight_layout()
+    fig.savefig(png, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+    return {
+        "ok": True,
+        "png_path": str(png),
+        "keyword": kw,
+        "source": source,
+        "report_step": step_used,
+        "k_layer": k_layer,
+        "grid_dims": [nx, ny, nz],
+        "layer_stats": {
+            "n_active": int(mask.sum()),
+            "min": float(layer_vals.min()),
+            "max": float(layer_vals.max()),
+            "mean": float(layer_vals.mean()),
+        },
     }
 
 

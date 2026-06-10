@@ -29,9 +29,9 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Mapping, Sequence
 
-_ON_WINDOWS = os.name == "nt"
-
 from .config import SETTINGS
+
+_ON_WINDOWS = os.name == "nt"
 
 _DRIVE_LETTER_RE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
 _WSL_UNC_RE = re.compile(r"^[\\/]{2}wsl(?:\$|\.localhost)[\\/]([^\\/]+)[\\/](.*)$", re.IGNORECASE)
@@ -74,24 +74,28 @@ def _wsl_exe() -> str:
 def _mount_prefix() -> str:
     """Return the WSL mount root for Windows drives, e.g. ``/mnt/`` or ``/``.
 
-    Detected once via ``wslpath -u 'C:/'`` and cached. Falls back to ``/mnt/``
-    if WSL is unreachable. This keeps path translation correct even when the
-    distro sets a non-default ``automount.root``.
+    Detected via ``wslpath -u 'C:/'`` and cached **only on success** — if the
+    probe fails (distro still booting, WSL unavailable) we fall back to
+    ``/mnt/`` for this call but leave the cache empty so a later call can still
+    pick up a non-default ``automount.root``.
     """
     global _mount_prefix_cache
     if _mount_prefix_cache is not None:
         return _mount_prefix_cache
-    prefix = "/mnt/"
+    if not _ON_WINDOWS:
+        # Drive-letter paths don't occur on a POSIX host; value is moot.
+        _mount_prefix_cache = "/mnt/"
+        return _mount_prefix_cache
     try:
         res = run(["wslpath", "-u", "C:/"], check=False, timeout=10)
         out = res.stdout.strip()
         m = re.match(r"^(/.*?/)c/?$", out) or re.match(r"^(/)c/?$", out)
         if m:
-            prefix = m.group(1)
+            _mount_prefix_cache = m.group(1)
+            return _mount_prefix_cache
     except Exception:
         pass
-    _mount_prefix_cache = prefix
-    return prefix
+    return "/mnt/"
 
 
 def _wsl_mnt_re() -> re.Pattern[str]:
@@ -163,8 +167,8 @@ def run(
     timeout: float | None = None,
     check: bool = True,
 ) -> WSLResult:
-    """Run a command synchronously inside the configured WSL distro."""
-    cmd = _build_command(argv, cwd=cwd, env=env)
+    """Run a command synchronously on the Linux side (WSL on Windows, direct on POSIX)."""
+    cmd, sub_env, sub_cwd = _build_command(argv, cwd=cwd, env=env)
     try:
         proc = subprocess.run(
             cmd,
@@ -173,6 +177,8 @@ def run(
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            env=sub_env,
+            cwd=sub_cwd,
         )
     except FileNotFoundError as exc:
         raise WSLError(str(exc)) from exc
@@ -195,7 +201,7 @@ def popen(
     equivalent of ``2>&1``), so a single capture file holds both — no second
     file handle fighting over the same offset.
     """
-    cmd = _build_command(argv, cwd=cwd, env=env)
+    cmd, sub_env, sub_cwd = _build_command(argv, cwd=cwd, env=env)
     stdout = open(stdout_path, "wb") if stdout_path else subprocess.PIPE
     if merge_stderr:
         stderr: Any = subprocess.STDOUT
@@ -210,11 +216,21 @@ def popen(
         stderr=stderr,
         stdin=subprocess.DEVNULL,
         creationflags=creationflags,
+        env=sub_env,
+        cwd=sub_cwd,
     )
 
 
 def wsl_pid_alive(pid: int) -> bool:
-    """Return True if a Linux PID is still alive inside the distro."""
+    """Return True if a Linux PID is still alive (distro on Windows, local on POSIX)."""
+    if not _ON_WINDOWS:
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
     res = run(
         ["bash", "-lc", f"kill -0 {int(pid)} 2>/dev/null && echo 1 || echo 0"],
         check=False,
@@ -223,8 +239,40 @@ def wsl_pid_alive(pid: int) -> bool:
     return res.stdout.strip().endswith("1")
 
 
+def wsl_pids_alive(pids: Sequence[int]) -> dict[int, bool]:
+    """Liveness for many PIDs in ONE round-trip.
+
+    Each ``wsl.exe`` invocation costs ~200 ms of VM hand-off, so checking five
+    inherited jobs one-by-one makes ``flow_jobs`` sluggish — batch them.
+    """
+    pids = [int(p) for p in pids]
+    if not pids:
+        return {}
+    if not _ON_WINDOWS:
+        return {p: wsl_pid_alive(p) for p in pids}
+    loop = "; ".join(f"kill -0 {p} 2>/dev/null && echo {p}:1 || echo {p}:0" for p in pids)
+    res = run(["bash", "-lc", loop], check=False, timeout=15)
+    out: dict[int, bool] = {p: False for p in pids}
+    for line in res.stdout.splitlines():
+        if ":" in line:
+            pid_s, _, flag = line.strip().partition(":")
+            try:
+                out[int(pid_s)] = flag == "1"
+            except ValueError:
+                continue
+    return out
+
+
 def wsl_kill(pid: int, *, force: bool = False) -> bool:
-    """Send SIGTERM (or SIGKILL) to a Linux PID inside the distro."""
+    """Send SIGTERM (or SIGKILL) to a Linux PID (distro on Windows, local on POSIX)."""
+    if not _ON_WINDOWS:
+        import signal as _signal
+
+        try:
+            os.kill(int(pid), _signal.SIGKILL if force else _signal.SIGTERM)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
     sig = "-9" if force else "-15"
     res = run(
         ["bash", "-lc", f"kill {sig} {int(pid)} 2>/dev/null && echo 1 || echo 0"],
@@ -239,9 +287,23 @@ def _build_command(
     *,
     cwd: str | None,
     env: Mapping[str, str] | None,
-) -> list[str]:
+) -> tuple[list[str], dict[str, str] | None, str | None]:
+    """Build ``(cmd, subprocess_env, subprocess_cwd)`` for this host.
+
+    On Windows the command is wrapped through ``wsl.exe`` with env/cwd baked
+    into the command line (subprocess env/cwd would apply to wsl.exe itself,
+    not the Linux child). On a POSIX host the binaries are local, so we run
+    them directly and let ``subprocess`` handle env/cwd — the same server
+    codebase then works on native Linux with no WSL involved.
+    """
     if not argv:
         raise ValueError("argv must contain at least the program name")
+    if not _ON_WINDOWS:
+        sub_env: dict[str, str] | None = None
+        if env:
+            sub_env = dict(os.environ)
+            sub_env.update(env)
+        return list(argv), sub_env, (str(cwd) if cwd else None)
     exe = _wsl_exe()
     cmd = [exe, "-d", SETTINGS.wsl_distro, "--"]
     if env:
@@ -255,7 +317,7 @@ def _build_command(
         cmd.extend(["bash", "-lc", shell_line])
     else:
         cmd.extend(list(argv))
-    return cmd
+    return cmd, None, None
 
 
 def _sh_escape(value: str) -> str:
@@ -272,12 +334,17 @@ def _shell_join(parts: Iterable[str]) -> str:
 
 def check_environment() -> dict[str, str]:
     """Quick health check used by the ``opm_environment`` MCP tool."""
-    info: dict[str, str] = {"wsl_distro": SETTINGS.wsl_distro}
-    try:
-        info["wsl_exe"] = _wsl_exe()
-    except WSLError as exc:
-        info["wsl_exe"] = f"ERROR: {exc}"
-        return info
+    info: dict[str, str] = {}
+    if _ON_WINDOWS:
+        info["mode"] = "windows + WSL"
+        info["wsl_distro"] = SETTINGS.wsl_distro
+        try:
+            info["wsl_exe"] = _wsl_exe()
+        except WSLError as exc:
+            info["wsl_exe"] = f"ERROR: {exc}"
+            return info
+    else:
+        info["mode"] = "native linux (no WSL)"
     # `flow --version` is cheap; ResInsight's --version spins up Qt/GL and
     # can hang for >20s in headless WSL, so probe it via dpkg + `command -v`
     # instead. Snapshots/logs still work when actually invoked (optionally

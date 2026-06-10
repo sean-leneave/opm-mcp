@@ -12,14 +12,17 @@ or, after ``pip install -e .``::
 
 from __future__ import annotations
 
+import functools
+from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 from . import wsl
 from .config import SETTINGS
 from .tools import analysis as analysis_tools
 from .tools import deck as deck_tools
+from .tools import discovery as discovery_tools
 from .tools import edit as edit_tools
 from .tools import flow as flow_tools
 from .tools import plots as plot_tools
@@ -44,12 +47,59 @@ mcp = FastMCP(
 )
 
 
+def _safe(fn):
+    """Uniform error contract: tools never surface raw tracebacks.
+
+    Every tool failure becomes ``{"ok": false, "error", "error_type"}`` so the
+    model gets something it can react to (retry, fix a path, pick another tool)
+    instead of an opaque MCP error.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — this is the tool boundary
+            return {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
+
+    return wrapper
+
+
+def safe_tool(**kwargs):
+    """``@safe_tool()`` with the :func:`_safe` error contract applied."""
+
+    def decorator(fn):
+        return mcp.tool(**kwargs)(_safe(fn))
+
+    return decorator
+
+
+def _with_inline_image(result: dict[str, Any], max_bytes: int = 1_500_000) -> Any:
+    """Attach the rendered PNG as inline MCP image content when small enough.
+
+    Claude Desktop renders the chart directly in the chat instead of the user
+    having to open the path. The dict payload still rides along as a second
+    content item, and is returned alone on failure or for oversized images.
+    """
+    png_path = result.get("png_path") if isinstance(result, dict) else None
+    if not (isinstance(result, dict) and result.get("ok") and png_path):
+        return result
+    try:
+        data = Path(png_path).read_bytes()
+    except OSError:
+        return result
+    if len(data) > max_bytes:
+        result["inline_image"] = f"skipped ({len(data)} bytes > {max_bytes})"
+        return result
+    return [Image(data=data, format="png"), result]
+
+
 # ---------------------------------------------------------------------------
 # Environment / introspection
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@safe_tool()
 def opm_environment() -> dict[str, str]:
     """Report which OPM binaries and Python bindings the server can reach.
 
@@ -62,13 +112,23 @@ def opm_environment() -> dict[str, str]:
     return info
 
 
-@mcp.tool()
+@safe_tool()
+def list_cases(directory: str, max_depth: int = 4, limit: int = 100) -> dict[str, Any]:
+    """Scan a directory tree for simulation cases (.DATA decks and .SMSPEC results).
+
+    The session opener: returns case names, deck paths, whether results exist,
+    and modification times (newest first).
+    """
+    return discovery_tools.list_cases(directory, max_depth=max_depth, limit=limit)
+
+
+@safe_tool()
 def to_wsl_path(windows_path: str) -> dict[str, str]:
     """Translate a Windows path to its WSL equivalent (``C:\\x`` → ``/mnt/c/x``)."""
     return {"input": windows_path, "wsl_path": wsl.to_wsl_path(windows_path)}
 
 
-@mcp.tool()
+@safe_tool()
 def to_windows_path(wsl_path: str) -> dict[str, str]:
     """Translate a WSL path back to its Windows form."""
     return {"input": wsl_path, "windows_path": wsl.to_windows_path(wsl_path)}
@@ -79,19 +139,19 @@ def to_windows_path(wsl_path: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@safe_tool()
 def validate_deck(deck_path: str) -> dict[str, Any]:
     """Parse an ECLIPSE/Flow DATA deck and report keyword counts + parser issues."""
     return deck_tools.validate_deck(deck_path)
 
 
-@mcp.tool()
+@safe_tool()
 def summarize_deck(deck_path: str) -> dict[str, Any]:
     """High-level deck summary: phases, units, grid dimensions, wells, schedule length."""
     return deck_tools.summarize_deck(deck_path)
 
 
-@mcp.tool()
+@safe_tool()
 def list_wells(deck_path: str) -> dict[str, Any]:
     """List wells declared in the deck at the first schedule step."""
     return deck_tools.list_wells(deck_path)
@@ -102,18 +162,22 @@ def list_wells(deck_path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@safe_tool()
 def run_flow(
     deck_path: str,
     extra_args: list[str] | None = None,
     output_dir: str | None = None,
     threads: int | None = None,
     convergence_info: str | None = "steps,iterations",
+    mpi_processes: int | None = None,
 ) -> dict[str, Any]:
-    """Start an OPM Flow simulation in the background. Returns a job id immediately.
+    """Start an OPM Flow simulation in the background; returns a job id immediately.
 
-    By default writes INFOSTEP/INFOITER diagnostics so ``flow_convergence_report``
-    works; pass ``convergence_info="none"`` to skip them.
+    At most OPM_MCP_MAX_PARALLEL jobs run at once — extra submissions are
+    state="queued" and launch automatically as slots free. By default writes
+    INFOSTEP/INFOITER diagnostics so ``flow_convergence_report`` works
+    (``convergence_info="none"`` to skip). ``mpi_processes=N`` runs
+    ``mpirun -np N`` for distributed solves.
     """
     return flow_tools.run_flow(
         deck_path,
@@ -121,28 +185,29 @@ def run_flow(
         output_dir=output_dir,
         threads=threads,
         convergence_info=convergence_info,
+        mpi_processes=mpi_processes,
     )
 
 
-@mcp.tool()
+@safe_tool()
 def flow_status(job_id: str) -> dict[str, Any]:
     """Check whether a Flow job is still running, with the latest progress line."""
     return flow_tools.flow_status(job_id)
 
 
-@mcp.tool()
+@safe_tool()
 def flow_log_tail(job_id: str, lines: int = 200) -> dict[str, Any]:
     """Return the tail of a Flow job's combined stdout/stderr log."""
     return flow_tools.flow_log_tail(job_id, lines=lines)
 
 
-@mcp.tool()
+@safe_tool()
 def flow_cancel(job_id: str) -> dict[str, Any]:
     """Cancel a running Flow job."""
     return flow_tools.flow_cancel(job_id)
 
 
-@mcp.tool()
+@safe_tool()
 def flow_jobs() -> dict[str, Any]:
     """List recent Flow jobs known to this server."""
     return flow_tools.flow_jobs()
@@ -153,13 +218,13 @@ def flow_jobs() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@safe_tool()
 def list_summary_vectors(case_path: str, pattern: str | None = None, limit: int = 200) -> dict[str, Any]:
     """List summary vector keys in a case. Optional glob pattern (case-insensitive)."""
     return result_tools.list_summary_vectors(case_path, pattern=pattern, limit=limit)
 
 
-@mcp.tool()
+@safe_tool()
 def read_summary(
     case_path: str,
     keys: list[str],
@@ -171,31 +236,31 @@ def read_summary(
     return result_tools.read_summary(case_path, keys, start=start, end=end, max_points=max_points)
 
 
-@mcp.tool()
+@safe_tool()
 def field_summary(case_path: str) -> dict[str, Any]:
     """Field-level KPIs: cumulative production/injection, pressure, final rates."""
     return result_tools.field_summary(case_path)
 
 
-@mcp.tool()
+@safe_tool()
 def well_summary(case_path: str, well: str) -> dict[str, Any]:
     """Per-well KPIs: oil/gas/water rates, BHP, cumulative production."""
     return result_tools.well_summary(case_path, well)
 
 
-@mcp.tool()
+@safe_tool()
 def grid_info(case_path: str) -> dict[str, Any]:
     """Static grid info: dimensions, active count, porosity/permeability stats."""
     return result_tools.grid_info(case_path)
 
 
-@mcp.tool()
+@safe_tool()
 def restart_info(case_path: str) -> dict[str, Any]:
     """List report steps available in a UNRST file plus the keywords it contains."""
     return result_tools.restart_info(case_path)
 
 
-@mcp.tool()
+@safe_tool()
 def compare_summaries(case_a: str, case_b: str, keys: list[str] | None = None) -> dict[str, Any]:
     """Compare two cases on field totals (or supplied keys). Default = FOPT/FGPT/FWPT/FPR."""
     return result_tools.compare_summaries(case_a, case_b, keys=keys)
@@ -206,7 +271,7 @@ def compare_summaries(case_a: str, case_b: str, keys: list[str] | None = None) -
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@safe_tool()
 def plot_summary(
     case_path: str,
     keys: list[str],
@@ -217,22 +282,54 @@ def plot_summary(
     x_axis: str = "date",
     max_points: int = 1000,
     twin_axis: bool = True,
-) -> dict[str, Any]:
-    """Plot summary vectors to a PNG (twin-axis by unit). Returns the image path.
+) -> Any:
+    """Plot summary vectors to a PNG, rendered inline in the chat.
 
-    No ResInsight/OpenGL needed — the fast path for rate/pressure/cumulative
-    line plots. ``x_axis`` is ``"date"`` or ``"days"``.
+    Keys accept wildcards (``WWCT:*``, ``GOPR:*``). Twin y-axis groups by
+    engineering unit; ``x_axis`` is ``"date"`` or ``"days"``. No
+    ResInsight/OpenGL needed — the fast path for rate/pressure/cumulative plots.
     """
-    return plot_tools.plot_summary(
-        case_path,
-        keys,
-        output_path=output_path,
-        title=title,
-        start=start,
-        end=end,
-        x_axis=x_axis,
-        max_points=max_points,
-        twin_axis=twin_axis,
+    return _with_inline_image(
+        plot_tools.plot_summary(
+            case_path,
+            keys,
+            output_path=output_path,
+            title=title,
+            start=start,
+            end=end,
+            x_axis=x_axis,
+            max_points=max_points,
+            twin_axis=twin_axis,
+        )
+    )
+
+
+@safe_tool()
+def plot_property_map(
+    case_path: str,
+    keyword: str = "SWAT",
+    k_layer: int = 1,
+    report_step: int | None = None,
+    output_path: str | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> Any:
+    """I–J areal map of a grid property for one K layer, rendered inline.
+
+    Dynamic (PRESSURE/SWAT/SGAS/SOIL from UNRST at a report step, default last)
+    or static (PORO/PERMX/NTG/PORV from INIT). Inactive cells blank; axes are
+    1-based I/J. The no-GL alternative to a ResInsight view for sweep/depletion QC.
+    """
+    return _with_inline_image(
+        plot_tools.plot_property_map(
+            case_path,
+            keyword=keyword,
+            k_layer=k_layer,
+            report_step=report_step,
+            output_path=output_path,
+            vmin=vmin,
+            vmax=vmax,
+        )
     )
 
 
@@ -241,19 +338,19 @@ def plot_summary(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@safe_tool()
 def material_balance_check(case_path: str) -> dict[str, Any]:
     """Field MB QC: OOIP, recovery factor, exact oil mass-balance drift, surface VRR."""
     return analysis_tools.material_balance_check(case_path)
 
 
-@mcp.tool()
+@safe_tool()
 def flow_convergence_report(case_path: str, worst_n: int = 5) -> dict[str, Any]:
     """Solver performance from INFOSTEP/INFOITER: time by stage, wasted steps, worst steps."""
     return analysis_tools.flow_convergence_report(case_path, worst_n=worst_n)
 
 
-@mcp.tool()
+@safe_tool()
 def restart_property(
     case_path: str,
     keyword: str = "PRESSURE",
@@ -266,12 +363,43 @@ def restart_property(
     )
 
 
+@safe_tool()
+def compare_to_observed(
+    case_path: str,
+    observed_csv: str,
+    keys: list[str] | None = None,
+    plot: bool = True,
+    output_path: str | None = None,
+) -> Any:
+    """History-match QC: misfit (RMSE/bias/MAE/NRMSE) of simulated vs observed data.
+
+    CSV: first column date (ISO), remaining headers are summary keys
+    (WBHP:PROD, FOPR, ...); blank cells = no observation. Returns per-key
+    stats and an inline sim-vs-obs overlay plot.
+    """
+    return _with_inline_image(
+        analysis_tools.compare_to_observed(
+            case_path, observed_csv, keys=keys, plot=plot, output_path=output_path
+        )
+    )
+
+
+@safe_tool()
+def rft_data(case_path: str, well: str | None = None, date: str | None = None) -> dict[str, Any]:
+    """RFT surveys (pressure vs depth at well connections) from CASE.RFT.
+
+    For perforation-pressure / gradient QC. Requires WRFTPLT in the deck's
+    SCHEDULE section. Cell i/j/k are 1-based.
+    """
+    return result_tools.rft_data(case_path, well=well, date=date)
+
+
 # ---------------------------------------------------------------------------
 # Deck editing (sensitivities / history matching)
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@safe_tool()
 def clone_deck(
     deck_path: str,
     output_path: str | None = None,
@@ -299,7 +427,7 @@ def clone_deck(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@safe_tool()
 def resinsight_snapshot(
     case_path: str,
     output_dir: str | None = None,
@@ -317,7 +445,7 @@ def resinsight_snapshot(
     )
 
 
-@mcp.tool()
+@safe_tool()
 def resinsight_well_log(
     case_path: str,
     well: str,
@@ -335,7 +463,7 @@ def resinsight_well_log(
     )
 
 
-@mcp.tool()
+@safe_tool()
 def resinsight_open(case_path: str | None = None) -> dict[str, Any]:
     """Open ResInsight as an interactive GUI (relies on WSLg). Returns immediately."""
     return ri_tools.launch_resinsight_interactive(case_path=case_path)
@@ -346,13 +474,13 @@ def resinsight_open(case_path: str | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@safe_tool()
 def convert_ecl(input_path: str, output_path: str | None = None, mode: str = "auto") -> dict[str, Any]:
     """Convert between formatted (F*) and unformatted ECL result files."""
     return util_tools.convert_ecl(input_path, output_path=output_path, mode=mode)
 
 
-@mcp.tool()
+@safe_tool()
 def compare_ecl(
     case_a: str,
     case_b: str,
@@ -364,31 +492,56 @@ def compare_ecl(
     return util_tools.compare_ecl(case_a, case_b, keywords=keywords, abs_tol=abs_tol, rel_tol=rel_tol)
 
 
-@mcp.tool()
+@safe_tool()
+def make_restart_deck(
+    base_deck: str,
+    restart_case: str,
+    report_step: int,
+    output_deck: str | None = None,
+    mode: str = "inline",
+    skiprest: bool = True,
+) -> dict[str, Any]:
+    """Generate a restart (history -> prediction) deck via OPM's ``rst_deck``.
+
+    Restarts ``base_deck`` from ``restart_case:report_step`` (see
+    ``restart_info`` for available steps). Default mode "inline" produces one
+    self-contained deck. Validate and run_flow the result for predictions.
+    """
+    return util_tools.make_restart_deck(
+        base_deck,
+        restart_case,
+        report_step,
+        output_deck=output_deck,
+        mode=mode,
+        skiprest=skiprest,
+    )
+
+
+@safe_tool()
 def pack_deck(deck_path: str, output_dir: str | None = None) -> dict[str, Any]:
     """Flatten a deck and all its INCLUDEs into a single file using ``opmpack``."""
     return util_tools.pack_deck(deck_path, output_dir=output_dir)
 
 
-@mcp.tool()
+@safe_tool()
 def hash_deck(deck_path: str) -> dict[str, Any]:
     """Compute a deterministic hash of a deck using ``opmhash``."""
     return util_tools.hash_deck(deck_path)
 
 
-@mcp.tool()
+@safe_tool()
 def summary_tool(case_path: str, keys: list[str] | None = None) -> dict[str, Any]:
     """Run the OPM ``summary`` CLI on a case (alternative summary reader)."""
     return util_tools.summary_tool(case_path, keys=keys)
 
 
-@mcp.tool()
+@safe_tool()
 def upscaling_status() -> dict[str, Any]:
     """Detect whether the optional ``opm-upscaling`` binaries are available."""
     return util_tools.upscaling_status()
 
 
-@mcp.tool()
+@safe_tool()
 def run_upscaling(tool: str, args: list[str], cwd: str | None = None) -> dict[str, Any]:
     """Run an opm-upscaling binary (``upscale_perm``, ``upscale_relperm``, etc.) passthrough."""
     return util_tools.run_upscaling(tool, args, cwd=cwd)

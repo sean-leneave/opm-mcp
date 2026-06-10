@@ -14,8 +14,6 @@ or similar, set ``LIBGL_ALWAYS_SOFTWARE=1`` in the env or have the user install
 
 from __future__ import annotations
 
-import json
-import tempfile
 from pathlib import Path
 from typing import Any
 

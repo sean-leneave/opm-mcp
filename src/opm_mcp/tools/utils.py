@@ -120,6 +120,103 @@ def summary_tool(case_path: str, keys: list[str] | None = None) -> dict[str, Any
     }
 
 
+def make_restart_deck(
+    base_deck: str,
+    restart_case: str,
+    report_step: int,
+    output_deck: str | None = None,
+    mode: str = "inline",
+    skiprest: bool = True,
+) -> dict[str, Any]:
+    """Generate a restart deck from a history run using OPM's ``rst_deck``.
+
+    The classic history→prediction workflow: run history, then restart from
+    report step N with changed controls. ``rst_deck`` clears the SOLUTION
+    section, inserts ``RESTART``, and either strips pre-restart SCHEDULE
+    keywords or (``skiprest=True``, default) inserts ``SKIPREST``.
+
+    Parameters
+    ----------
+    base_deck : str
+        The original ``.DATA`` deck of the history run.
+    restart_case : str
+        Case prefix of the run holding the restart file (e.g. the
+        ``case_prefix_win`` from ``flow_status``); ``:report_step`` is appended.
+    report_step : int
+        SEQNUM report step to restart from (see ``restart_info``).
+    output_deck : str | None
+        Destination ``.DATA``. Defaults to ``<workdir>/decks/<CASE>_RST<N>.DATA``.
+    mode : str
+        ``inline`` (default — one self-contained file, safest across the
+        Windows/WSL path boundary), ``share`` or ``copy``.
+    """
+    from ..config import SETTINGS
+
+    base_wsl = wsl.to_wsl_path(base_deck)
+    case_wsl = wsl.to_wsl_path(restart_case)
+    # rst_deck wants the restart source as a case prefix, not a file path.
+    for ext in (".DATA", ".UNRST", ".SMSPEC"):
+        if case_wsl.upper().endswith(ext):
+            case_wsl = case_wsl[: -len(ext)]
+            break
+    if output_deck:
+        out_win = Path(output_deck) if not output_deck.startswith("/") else Path(wsl.to_windows_path(output_deck))
+    else:
+        case_name = Path(case_wsl).stem
+        out_win = SETTINGS.work_dir / "decks" / f"{case_name}_RST{report_step}.DATA"
+    out_win.parent.mkdir(parents=True, exist_ok=True)
+    out_wsl = wsl.to_wsl_path(str(out_win))
+
+    argv = ["rst_deck", base_wsl, f"{case_wsl}:{int(report_step)}", out_wsl, "-m", mode]
+    if skiprest:
+        argv.append("-s")
+    res = wsl.run(argv, check=False, timeout=300)
+    produced = out_win.exists()
+    unifin_added = False
+    if produced:
+        unifin_added = _ensure_unifin(out_win, case_wsl)
+    return {
+        "ok": res.returncode == 0 and produced,
+        "returncode": res.returncode,
+        "output_deck": str(out_win) if produced else None,
+        "output_deck_wsl": out_wsl if produced else None,
+        "argv": argv,
+        "stdout_tail": res.stdout[-1500:],
+        "stderr_tail": res.stderr[-1500:],
+        "unifin_added": unifin_added,
+        "note": "Run validate_deck on the result, then run_flow it for the prediction.",
+    }
+
+
+def _ensure_unifin(deck_win: Path, restart_case_wsl: str) -> bool:
+    """Insert UNIFIN when the restart source is a unified UNRST.
+
+    ``rst_deck`` copies RUNSPEC verbatim, so a base deck with only UNIFOUT
+    yields a restart deck that expects separate ``.X000N`` files while the
+    history run actually wrote a unified ``.UNRST`` — flow then aborts with
+    "restart file ... .X000N does not exist". Detect that mismatch and patch.
+    """
+    import re
+
+    unrst_win = Path(wsl.to_windows_path(restart_case_wsl + ".UNRST"))
+    if not unrst_win.exists():
+        return False
+    try:
+        text = deck_win.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if re.search(r"(?im)^[ \t]*UNIFIN[ \t]*$", text):
+        return False
+    m = re.search(r"(?im)^[ \t]*RUNSPEC[ \t]*$", text)
+    if not m:
+        return False
+    insert_at = text.find("\n", m.end())
+    insert_at = insert_at + 1 if insert_at != -1 else len(text)
+    text = text[:insert_at] + "\nUNIFIN\n" + text[insert_at:]
+    deck_win.write_text(text, encoding="utf-8")
+    return True
+
+
 def upscaling_status() -> dict[str, Any]:
     """Detect whether OPM upscaling tools are installed in WSL.
 

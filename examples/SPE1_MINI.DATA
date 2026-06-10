@@ -164,6 +164,11 @@ COMPDAT
  'INJ'  5 5 1 1 'OPEN' 1* 1* 0.5 /
 /
 
+-- RFT output at every report step (exercises the rft_data tool).
+WRFTPLT
+ 'PROD' 'REPT' /
+/
+
 WCONPROD
  'PROD' 'OPEN' 'ORAT' 500 1* 1* 1* 1* 1000 /
 /

@@ -108,9 +108,10 @@ def read_summary(
     if not keys:
         return {"ok": False, "error": "at least one key is required"}
     summary = _open_summary(case_path)
+    resolved, unmatched, truncated = _expand_keys(summary, keys)
     available = set(summary.keys())
-    missing = [k for k in keys if k not in available]
-    requested = [k for k in keys if k in available]
+    missing = [k for k in resolved if k not in available] + unmatched
+    requested = [k for k in resolved if k in available]
     if not requested:
         return {"ok": False, "error": "no requested keys exist in case", "missing": missing}
 
@@ -137,6 +138,7 @@ def read_summary(
         "vectors": vectors,
         "missing": missing,
         "n_points": len(idx),
+        "wildcard_truncated": truncated,
     }
 
 
@@ -146,6 +148,38 @@ def _unit_of(summary, key: str) -> str | None:
         return summary.unit(key)
     except Exception:
         return None
+
+
+def _expand_keys(summary, keys: list[str], cap: int = 40) -> tuple[list[str], list[str], bool]:
+    """Expand glob patterns (``WWCT:*``, ``GOPR:G?``) against the SMSPEC keys.
+
+    Returns ``(resolved, unmatched_patterns, truncated)``. Plain keys pass
+    through untouched (existence is checked by the caller); patterns that match
+    nothing are reported, not silently dropped. ``cap`` bounds the expansion so
+    a careless ``*`` on a 10k-vector case doesn't flood the payload.
+    """
+    from fnmatch import fnmatchcase
+
+    available = list(summary.keys())
+    out: list[str] = []
+    unmatched: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        if any(c in key for c in "*?["):
+            pat = key.upper()
+            matches = sorted(k for k in available if fnmatchcase(k.upper(), pat))
+            if not matches:
+                unmatched.append(key)
+            for m in matches:
+                if m not in seen:
+                    seen.add(m)
+                    out.append(m)
+        else:
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+    truncated = bool(cap) and len(out) > cap
+    return (out[:cap] if truncated else out), unmatched, truncated
 
 
 def field_summary(case_path: str) -> dict[str, Any]:
@@ -259,6 +293,82 @@ def restart_info(case_path: str) -> dict[str, Any]:
         "report_steps": steps,
         "keywords": sorted(keywords),
     }
+
+
+def rft_data(case_path: str, well: str | None = None, date: str | None = None) -> dict[str, Any]:
+    """Read RFT surveys (pressure vs depth at well connections) from CASE.RFT.
+
+    Used to QC perforation pressures against the reservoir gradient and to
+    compare with wireline formation-test data. Requires the deck to request
+    RFT output (``WRFTPLT 'WELL' 'REPT' /`` in SCHEDULE).
+
+    Parameters
+    ----------
+    well : str | None
+        Filter to one well name (case-insensitive). None = all wells.
+    date : str | None
+        Filter to surveys whose date starts with this string (``"2026-04"``).
+
+    Cell ``i``/``j``/``k`` are reported 1-based, matching deck conventions.
+    """
+    from resdata.rft import ResdataRFTFile
+
+    root = _case_root(case_path)
+    rft_path = Path(str(root) + ".RFT")
+    if not rft_path.exists():
+        return {
+            "ok": False,
+            "error": f"RFT file not found: {rft_path}",
+            "hint": "Add `WRFTPLT 'WELLNAME' 'REPT' /` to the SCHEDULE section and rerun.",
+        }
+    f = ResdataRFTFile(str(rft_path))
+    surveys: list[dict[str, Any]] = []
+    for rft in f:
+        wname = rft.get_well_name() if hasattr(rft, "get_well_name") else getattr(rft, "name", "?")
+        d = rft.get_date() if hasattr(rft, "get_date") else getattr(rft, "date", None)
+        dstr = str(d)
+        if well and wname.upper() != well.upper():
+            continue
+        if date and not dstr.startswith(date):
+            continue
+        cells = []
+        for c in rft:
+            cells.append(
+                {
+                    "depth": _maybe_float(getattr(c, "depth", None)),
+                    "pressure": _maybe_float(getattr(c, "pressure", None)),
+                    "swat": _maybe_float(getattr(c, "swat", None)),
+                    "sgas": _maybe_float(getattr(c, "sgas", None)),
+                    "i": _cell_index(c, "i"),
+                    "j": _cell_index(c, "j"),
+                    "k": _cell_index(c, "k"),
+                }
+            )
+        cells.sort(key=lambda x: (x["depth"] is None, x["depth"]))
+        surveys.append({"well": wname, "date": dstr, "n_cells": len(cells), "cells": cells})
+    return {
+        "ok": True,
+        "case_path": str(root),
+        "n_surveys": len(surveys),
+        "surveys": surveys,
+    }
+
+
+def _maybe_float(v) -> float | None:
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cell_index(cell, axis: str) -> int | None:
+    """1-based cell index from a resdata RFT cell, tolerant of API variants."""
+    getter = getattr(cell, f"get_{axis}", None)
+    raw = getter() if callable(getter) else getattr(cell, axis, None)
+    try:
+        return None if raw is None else int(raw) + 1
+    except (TypeError, ValueError):
+        return None
 
 
 def compare_summaries(case_a: str, case_b: str, keys: Iterable[str] | None = None) -> dict[str, Any]:

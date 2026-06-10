@@ -26,6 +26,7 @@ class Settings:
     flow_default_threads: int
     job_history_size: int
     log_tail_default: int
+    max_parallel: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -41,6 +42,7 @@ class Settings:
             flow_default_threads=int(_env("OPM_MCP_FLOW_THREADS", "0")),
             job_history_size=int(_env("OPM_MCP_JOB_HISTORY", "50")),
             log_tail_default=int(_env("OPM_MCP_LOG_TAIL", "200")),
+            max_parallel=max(1, int(_env("OPM_MCP_MAX_PARALLEL", "2"))),
         )
 
 

@@ -6,7 +6,55 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
+## [0.2.0] - 2026-06-08
+
+### Added (analyst pack 2)
+
+- **Wildcard summary keys**: `read_summary` / `plot_summary` expand patterns
+  like `WWCT:*` and `GOPR:*` (capped, case-insensitive, unmatched patterns
+  reported).
+- **`plot_property_map`**: I–J areal heatmap of a layer property — dynamic
+  (PRESSURE/SWAT/SGAS/SOIL from UNRST) or static (PORO/PERMX/NTG/PORV from
+  INIT) — with no ResInsight/OpenGL dependency.
+- **`compare_to_observed`**: observed-vs-simulated misfit (RMSE, bias, MAE,
+  NRMSE per key) from a CSV of observations, with an overlay plot. The
+  history-matching QC loop.
+- **`make_restart_deck`**: history→prediction workflow via OPM's `rst_deck`,
+  including an automatic `UNIFIN` patch when restarting from unified output.
+- **`rft_data`**: RFT pressure-vs-depth surveys per well/date (1-based i/j/k).
+- **`list_cases`**: scan a directory tree for decks/results to open a session.
+- **MPI runs**: `run_flow(mpi_processes=N)` → `mpirun -np N flow`.
+- **Inline images**: `plot_summary`, `plot_property_map` and
+  `compare_to_observed` return the PNG as MCP image content, so charts render
+  directly in the chat.
+
+### Added (engineering)
+
+- **Native-Linux backend**: on a POSIX host the server runs OPM binaries
+  directly (no `wsl.exe`), so the same package serves Linux users; path
+  translation degrades to pass-through.
+- **Bounded concurrency**: at most `OPM_MCP_MAX_PARALLEL` (default 2) flow jobs
+  run at once; extra submissions queue (`state="queued"`, with
+  `queue_position`) and launch automatically, including after a server restart.
+- **Job provenance**: `job.json` records the flow version and the SHA-256 of
+  the submitted deck.
+- **Uniform error contract**: every tool failure returns structured
+  `{"ok": false, "error", "error_type"}` instead of a raw traceback.
+- CI: ruff linting + POSIX job-manager integration tests against a stub flow
+  binary; release workflow (PyPI trusted publishing) and MCP-registry
+  `server.json`.
+
+### Fixed
+
+- **PV-weighted averages on real field models**: `PORV` is global-size in INIT
+  files; it is now compressed to active cells via the grid index map instead of
+  silently disabling weighting on any grid with inactive cells.
+- Mount-root detection no longer caches the `/mnt/` fallback when the `wslpath`
+  probe fails (e.g. distro still booting).
+- `flow_jobs` batches PID-liveness checks into one WSL round-trip.
+- Job rehydration is lazy (first use) instead of an import side effect.
+
+### Added (analytics & plotting, 2026-06-07 batch)
 
 - **Native plotting**: `plot_summary` renders summary vectors to PNG with
   automatic twin-axis grouping by engineering unit and a date/days x-axis — no
@@ -37,11 +85,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   (status polling is no longer O(filesize)).
 - `Summary` objects are cached by mtime to avoid re-parsing SMSPEC repeatedly.
 
-### Fixed
+### Fixed (2026-06-07 batch)
 
 - Replaced deprecated `datetime.utcfromtimestamp` (warned/removed on 3.12+).
 - Example deck now requests `INIT`, so `grid_info` static-property stats and
-  PV-weighted `restart_property` averages work.
+  PV-weighted `restart_property` averages work; it also requests RFT output
+  (`WRFTPLT`) so `rft_data` can be exercised out of the box.
 
 ## [0.1.0] - 2026-06-07
 
