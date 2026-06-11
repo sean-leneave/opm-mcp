@@ -135,8 +135,10 @@ your `mcpServers` block:
 | Tool             | Purpose                                                         |
 | ---------------- | --------------------------------------------------------------- |
 | `validate_deck`  | Parse a DATA deck, report keyword counts.                       |
-| `summarize_deck` | Phases, units, grid dims, well/group counts, schedule length.   |
+| `summarize_deck` | Title, phases, units, grid dims, well/group names, schedule length. |
 | `list_wells`     | Per-well info at schedule step 0.                               |
+| `deck_text`      | Numbered text slice of the deck or any include file (host-native, no WSL). |
+| `deck_grep`      | Regex search across the deck **and its INCLUDE tree** (resolves `PATHS` `$ALIAS`es). |
 
 ### OPM Flow (background jobs)
 
@@ -144,7 +146,7 @@ your `mcpServers` block:
 | ---------------- | -------------------------------------------------------------------- |
 | `run_flow`       | Start a Flow job; returns a `job_id` immediately. Queues (`state="queued"`) past `OPM_MCP_MAX_PARALLEL`; `mpi_processes=N` runs `mpirun -np N`. |
 | `flow_status`    | Current state, queue position, last progress line, provenance (flow version + deck SHA-256). |
-| `flow_log_tail`  | Tail of combined stdout/stderr.                                      |
+| `flow_log_tail`  | Tail of combined stdout/stderr; `grep=` regex-filters the whole log (e.g. `"will be shut\|Error:"`). |
 | `flow_cancel`    | Cancel a running or queued job (works across server restarts).       |
 | `flow_jobs`      | List recent jobs (most recent first).                                |
 

@@ -19,9 +19,11 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP, Image
 
 from . import wsl
+from .coerce import arg_list, key_list
 from .config import SETTINGS
 from .tools import analysis as analysis_tools
 from .tools import deck as deck_tools
+from .tools import decktext as decktext_tools
 from .tools import discovery as discovery_tools
 from .tools import edit as edit_tools
 from .tools import flow as flow_tools
@@ -42,7 +44,11 @@ mcp = FastMCP(
         "convergence diagnostics, per-layer restart-property stats, and a "
         "deck editor for sensitivities. For PVT/SCAL/relperm calculations, "
         "defer to the pyrestoolbox MCP if present. "
-        "Linux binaries run inside a WSL2 distro; the server itself runs on Windows."
+        "Linux binaries run inside a WSL2 distro; the server itself runs on Windows. "
+        "Paths: tools accept Windows or WSL forms as input. In responses, "
+        "fields suffixed _wsl (/mnt/c/...) are valid ONLY inside the WSL "
+        "distro — the host shell (PowerShell/Git Bash) needs the _win forms. "
+        "Use to_windows_path / to_wsl_path to convert."
     ),
 )
 
@@ -157,6 +163,48 @@ def list_wells(deck_path: str) -> dict[str, Any]:
     return deck_tools.list_wells(deck_path)
 
 
+@safe_tool()
+def deck_text(
+    deck_path: str,
+    start_line: int = 1,
+    n_lines: int = 200,
+    file: str | None = None,
+) -> dict[str, Any]:
+    """Numbered text slice of a deck (or one of its include files) — no WSL needed.
+
+    Decks are plain ASCII; use this instead of host-shell head/sed when a
+    client misdetects .DATA as binary. ``file`` selects an include file by
+    path or bare name (matched against the resolved INCLUDE tree).
+    """
+    return decktext_tools.deck_text(deck_path, start_line=start_line, n_lines=n_lines, file=file)
+
+
+@safe_tool()
+def deck_grep(
+    deck_path: str,
+    pattern: str,
+    context: int = 2,
+    search_includes: bool = True,
+    max_matches: int = 40,
+    ignore_case: bool = True,
+) -> dict[str, Any]:
+    """Regex search across a deck AND its resolved INCLUDE tree (PATHS-aware).
+
+    The deck-QC workhorse: ``deck_grep(deck, "^WCONPROD|^LIFTOPT", context=8)``
+    returns file, line number, and context for every keyword hit — including
+    keywords that live in include files referenced via $ALIAS paths. Files
+    larger than ~8 MB (bulk GRDECL arrays) are skipped and reported.
+    """
+    return decktext_tools.deck_grep(
+        deck_path,
+        pattern,
+        context=context,
+        search_includes=search_includes,
+        max_matches=max_matches,
+        ignore_case=ignore_case,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Flow simulation jobs (background)
 # ---------------------------------------------------------------------------
@@ -165,7 +213,7 @@ def list_wells(deck_path: str) -> dict[str, Any]:
 @safe_tool()
 def run_flow(
     deck_path: str,
-    extra_args: list[str] | None = None,
+    extra_args: list[str] | str | None = None,
     output_dir: str | None = None,
     threads: int | None = None,
     convergence_info: str | None = "steps,iterations",
@@ -173,15 +221,17 @@ def run_flow(
 ) -> dict[str, Any]:
     """Start an OPM Flow simulation in the background; returns a job id immediately.
 
-    At most OPM_MCP_MAX_PARALLEL jobs run at once — extra submissions are
-    state="queued" and launch automatically as slots free. By default writes
-    INFOSTEP/INFOITER diagnostics so ``flow_convergence_report`` works
-    (``convergence_info="none"`` to skip). ``mpi_processes=N`` runs
+    ``extra_args`` is a JSON array of flow flags, e.g.
+    ``["--enable-tuning=true"]`` — a plain string is also accepted and split
+    shell-style. At most OPM_MCP_MAX_PARALLEL jobs run at once — extra
+    submissions are state="queued" and launch automatically as slots free. By
+    default writes INFOSTEP/INFOITER diagnostics so ``flow_convergence_report``
+    works (``convergence_info="none"`` to skip). ``mpi_processes=N`` runs
     ``mpirun -np N`` for distributed solves.
     """
     return flow_tools.run_flow(
         deck_path,
-        extra_args=extra_args,
+        extra_args=arg_list(extra_args),
         output_dir=output_dir,
         threads=threads,
         convergence_info=convergence_info,
@@ -196,9 +246,15 @@ def flow_status(job_id: str) -> dict[str, Any]:
 
 
 @safe_tool()
-def flow_log_tail(job_id: str, lines: int = 200) -> dict[str, Any]:
-    """Return the tail of a Flow job's combined stdout/stderr log."""
-    return flow_tools.flow_log_tail(job_id, lines=lines)
+def flow_log_tail(job_id: str, lines: int = 200, grep: str | None = None) -> dict[str, Any]:
+    """Return the tail of a Flow job's combined stdout/stderr log.
+
+    ``grep`` (case-insensitive regex) filters the WHOLE log first and returns
+    the last ``lines`` matching lines with line numbers — e.g.
+    ``grep="will be shut|Problem:|Error:"`` extracts well-shut and solver
+    events from a long run.
+    """
+    return flow_tools.flow_log_tail(job_id, lines=lines, grep=grep)
 
 
 @safe_tool()
@@ -227,13 +283,19 @@ def list_summary_vectors(case_path: str, pattern: str | None = None, limit: int 
 @safe_tool()
 def read_summary(
     case_path: str,
-    keys: list[str],
+    keys: list[str] | str,
     start: str | None = None,
     end: str | None = None,
     max_points: int = 500,
 ) -> dict[str, Any]:
-    """Read one or more summary vectors as time series, downsampled to ``max_points``."""
-    return result_tools.read_summary(case_path, keys, start=start, end=end, max_points=max_points)
+    """Read one or more summary vectors as time series, downsampled to ``max_points``.
+
+    ``keys`` is a JSON array (``["FOPR", "WBHP:B-1H"]``); a comma/space
+    separated string is also accepted.
+    """
+    return result_tools.read_summary(
+        case_path, key_list(keys), start=start, end=end, max_points=max_points
+    )
 
 
 @safe_tool()
@@ -261,9 +323,9 @@ def restart_info(case_path: str) -> dict[str, Any]:
 
 
 @safe_tool()
-def compare_summaries(case_a: str, case_b: str, keys: list[str] | None = None) -> dict[str, Any]:
+def compare_summaries(case_a: str, case_b: str, keys: list[str] | str | None = None) -> dict[str, Any]:
     """Compare two cases on field totals (or supplied keys). Default = FOPT/FGPT/FWPT/FPR."""
-    return result_tools.compare_summaries(case_a, case_b, keys=keys)
+    return result_tools.compare_summaries(case_a, case_b, keys=key_list(keys))
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +336,7 @@ def compare_summaries(case_a: str, case_b: str, keys: list[str] | None = None) -
 @safe_tool()
 def plot_summary(
     case_path: str,
-    keys: list[str],
+    keys: list[str] | str,
     output_path: str | None = None,
     title: str | None = None,
     start: str | None = None,
@@ -285,14 +347,15 @@ def plot_summary(
 ) -> Any:
     """Plot summary vectors to a PNG, rendered inline in the chat.
 
-    Keys accept wildcards (``WWCT:*``, ``GOPR:*``). Twin y-axis groups by
+    Keys accept wildcards (``WWCT:*``, ``GOPR:*``) as a JSON array; a
+    comma/space separated string also works. Twin y-axis groups by
     engineering unit; ``x_axis`` is ``"date"`` or ``"days"``. No
     ResInsight/OpenGL needed — the fast path for rate/pressure/cumulative plots.
     """
     return _with_inline_image(
         plot_tools.plot_summary(
             case_path,
-            keys,
+            key_list(keys),
             output_path=output_path,
             title=title,
             start=start,
@@ -484,12 +547,14 @@ def convert_ecl(input_path: str, output_path: str | None = None, mode: str = "au
 def compare_ecl(
     case_a: str,
     case_b: str,
-    keywords: list[str] | None = None,
+    keywords: list[str] | str | None = None,
     abs_tol: float = 1e-3,
     rel_tol: float = 1e-3,
 ) -> dict[str, Any]:
     """Compare two ECL result files within tolerances using ``compareECL``."""
-    return util_tools.compare_ecl(case_a, case_b, keywords=keywords, abs_tol=abs_tol, rel_tol=rel_tol)
+    return util_tools.compare_ecl(
+        case_a, case_b, keywords=key_list(keywords), abs_tol=abs_tol, rel_tol=rel_tol
+    )
 
 
 @safe_tool()
@@ -530,9 +595,9 @@ def hash_deck(deck_path: str) -> dict[str, Any]:
 
 
 @safe_tool()
-def summary_tool(case_path: str, keys: list[str] | None = None) -> dict[str, Any]:
+def summary_tool(case_path: str, keys: list[str] | str | None = None) -> dict[str, Any]:
     """Run the OPM ``summary`` CLI on a case (alternative summary reader)."""
-    return util_tools.summary_tool(case_path, keys=keys)
+    return util_tools.summary_tool(case_path, keys=key_list(keys))
 
 
 @safe_tool()
@@ -542,9 +607,13 @@ def upscaling_status() -> dict[str, Any]:
 
 
 @safe_tool()
-def run_upscaling(tool: str, args: list[str], cwd: str | None = None) -> dict[str, Any]:
-    """Run an opm-upscaling binary (``upscale_perm``, ``upscale_relperm``, etc.) passthrough."""
-    return util_tools.run_upscaling(tool, args, cwd=cwd)
+def run_upscaling(tool: str, args: list[str] | str, cwd: str | None = None) -> dict[str, Any]:
+    """Run an opm-upscaling binary (``upscale_perm``, ``upscale_relperm``, etc.) passthrough.
+
+    ``args`` is a JSON array; a plain string is also accepted and split
+    shell-style.
+    """
+    return util_tools.run_upscaling(tool, arg_list(args) or [], cwd=cwd)
 
 
 def main() -> None:

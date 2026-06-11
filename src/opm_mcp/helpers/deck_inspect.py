@@ -128,6 +128,13 @@ def _well_names(sched) -> list[str]:
 
 
 def _group_names(sched) -> list[str]:
+    # opm 2025.10 exposes Schedule._groups(report_step) -> [Group] with .name;
+    # older bindings had group_names()/groups. Probe newest-first.
+    if hasattr(sched, "_groups"):
+        try:
+            return [g.name for g in sched._groups(0)]
+        except Exception:
+            pass
     for accessor in ("group_names", "groups"):
         if hasattr(sched, accessor):
             try:
@@ -164,13 +171,14 @@ def _date(sched, which: str) -> str | None:
 def _title(deck) -> str | None:
     for kw in deck:
         if kw.name == "TITLE":
-            # TITLE record is a single DeckRecord with one DeckItem holding strings.
+            # One DeckRecord with one string DeckItem holding the title words.
+            # DeckItem has no __getitem__/__len__; the values come from
+            # get_data_list() (all words) or get_str(i) (one word).
             try:
-                rec = kw[0]
-                item = rec[0]
-                if hasattr(item, "__len__"):
-                    return " ".join(str(item[i]) for i in range(len(item))).strip()
-                return str(item).strip()
+                item = kw[0][0]
+                if hasattr(item, "get_data_list"):
+                    return " ".join(str(s) for s in item.get_data_list()).strip()
+                return str(item.get_str(0)).strip()
             except Exception:
                 return None
     return None

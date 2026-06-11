@@ -212,7 +212,9 @@ def field_summary(case_path: str) -> dict[str, Any]:
     if len(dates):
         out["t0"] = _iso(dates[0])
         out["t_end"] = _iso(dates[-1])
-        out["n_report_steps"] = int(len(dates))
+        # Summary output timesteps (ministeps), NOT schedule report steps —
+        # a 13-report-step run can easily have 80+ of these.
+        out["n_summary_points"] = int(len(dates))
     return out
 
 

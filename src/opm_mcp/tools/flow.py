@@ -6,6 +6,7 @@ returns a JSON-serialisable dict so Claude gets structured data back.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .. import jobs, wsl
@@ -102,8 +103,35 @@ def flow_status(job_id: str) -> dict[str, Any]:
     }
 
 
-def flow_log_tail(job_id: str, lines: int = 200) -> dict[str, Any]:
-    """Return the last ``lines`` lines of the merged stdout/stderr log."""
+def flow_log_tail(job_id: str, lines: int = 200, grep: str | None = None) -> dict[str, Any]:
+    """Return the last ``lines`` lines of the merged stdout/stderr log.
+
+    With ``grep`` (case-insensitive regex) the *whole* log is filtered first
+    and the last ``lines`` matching lines come back, each prefixed with its
+    line number — e.g. ``grep="will be shut|Problem:|Error:"`` pulls the
+    well-shut / solver-failure story out of a long run without host-side grep.
+    """
+    if grep:
+        try:
+            rx = re.compile(grep, re.IGNORECASE)
+        except re.error as exc:
+            return {"ok": False, "job_id": job_id, "error": f"bad regex: {exc}"}
+        job = jobs.get_job(job_id)
+        matched: list[str] = []
+        try:
+            with open(job.log_path, encoding="utf-8", errors="replace") as fh:
+                for i, line in enumerate(fh, 1):
+                    if rx.search(line):
+                        matched.append(f"{i}: {line.rstrip()}")
+        except OSError as exc:
+            return {"ok": False, "job_id": job_id, "error": str(exc)}
+        return {
+            "job_id": job_id,
+            "lines": lines,
+            "grep": grep,
+            "n_matches": len(matched),
+            "tail": "\n".join(matched[-lines:]),
+        }
     text = jobs.tail_log(job_id, lines=lines)
     return {"job_id": job_id, "lines": lines, "tail": text}
 

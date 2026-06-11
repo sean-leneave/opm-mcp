@@ -6,6 +6,38 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (field-feedback fixes — see FEEDBACK.md)
+
+- **`deck_text` / `deck_grep`**: host-native deck text access — numbered
+  slices and regex search across the deck *and its resolved INCLUDE tree*
+  (`PATHS` `$ALIAS` substitution honoured, oversized GRDECL blobs skipped).
+  No WSL round-trip; works even when the client misdetects `.DATA` as binary.
+- **`flow_log_tail(grep=...)`**: case-insensitive regex filter over the whole
+  job log with line numbers — extracts well-shut / solver-failure events
+  without host-side grep.
+- **Lenient list params** (`opm_mcp.coerce`): every `list[str]` tool parameter
+  (`run_flow.extra_args`, `read_summary.keys`, `plot_summary.keys`,
+  `compare_summaries.keys`, `summary_tool.keys`, `compare_ecl.keywords`,
+  `run_upscaling.args`) now also accepts a plain string — shell-style split
+  for CLI flags, comma/space split for summary keys. Fixes
+  `extra_args="--enable-tuning=true"` bouncing with a pydantic `list_type`
+  error in clients that flatten schema unions.
+
+### Fixed
+
+- **`summarize_deck`** returned `title: null` and `groups: count 0` with the
+  opm 2025.10 bindings — title now read via `DeckItem.get_data_list()`, groups
+  via `Schedule._groups(report_step)` (legacy accessors kept as fallback).
+- **Dual-form paths in deck tools**: `validate_deck` / `summarize_deck` /
+  `list_wells` echoed only the WSL form (`/mnt/c/...`), which does not resolve
+  in the host shell. They now return `deck_path` (as passed), `deck_path_win`,
+  and `deck_path_wsl`; server instructions document the convention.
+
+### Changed
+
+- **`field_summary`**: `n_report_steps` renamed to `n_summary_points` — the
+  count is summary ministeps, not schedule report steps.
+
 ## [0.2.0] - 2026-06-08
 
 ### Added (analyst pack 2)

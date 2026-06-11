@@ -42,6 +42,12 @@ def _run(action: str, deck_path: str) -> dict:
             "stderr": res.stderr[-2000:],
         }
     payload.setdefault("returncode", res.returncode)
+    # The helper runs inside WSL and reports the WSL form. Echo both dialects
+    # explicitly — a bare `/mnt/c/...` invites the caller to paste it into the
+    # host shell (PowerShell/Git Bash), where it does not resolve.
+    payload["deck_path"] = deck_path
+    payload["deck_path_win"] = wsl.to_windows_path(deck_wsl)
+    payload["deck_path_wsl"] = deck_wsl
     return payload
 
 
