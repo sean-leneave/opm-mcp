@@ -510,7 +510,15 @@ def _prune_locked() -> None:
 
 
 def _ensure_loaded() -> None:
-    """Rehydrate jobs from prior server runs, once, on first use (not import)."""
+    """Rehydrate jobs from prior server runs, once, on first use (not import).
+
+    Reloaded jobs are **never** auto-launched. The work directory is shared by
+    every process that imports this module, so a job persisted as ``queued`` is
+    very likely still owned and about to be launched by the process that
+    submitted it. Auto-resuming here raced that owner and started a second
+    ``flow`` on the same output directory, corrupting both runs. Adoption is
+    now explicit: see :func:`resume_orphaned_jobs`.
+    """
     global _LOADED
     if _LOADED:
         return
@@ -519,8 +527,19 @@ def _ensure_loaded() -> None:
             return
         _LOADED = True
         _load_jobs_from_disk()
-    # Resume anything a previous server instance left queued.
+
+
+def resume_orphaned_jobs() -> list[str]:
+    """Explicitly adopt jobs a previous process left queued, and launch them.
+
+    Only call this when no other process is submitting to the same work
+    directory — otherwise the two will race for the same output paths.
+    """
+    _ensure_loaded()
+    with _JOB_LOCK:
+        adopted = [j.job_id for j in _JOBS.values() if j.state == "queued"]
     _pump()
+    return adopted
 
 
 def _load_jobs_from_disk() -> None:

@@ -98,6 +98,28 @@ def test_failed_run_classified_with_error(jobs_mod, tmp_path):
     assert "deck exploded" in (done.error or "")
 
 
+def test_reloading_does_not_relaunch_queued_jobs(jobs_mod, tmp_path):
+    """A second process must not adopt-and-launch another's queued jobs.
+
+    Regression: _ensure_loaded() used to call _pump(), so any other process
+    sharing the work dir started a duplicate flow on the same output directory.
+    """
+    deck = tmp_path / "X.DATA"
+    deck.write_text("RUNSPEC\nEND\n", encoding="utf-8")
+    jobs_mod.start_flow_job(str(deck), convergence_info=None)          # runs
+    queued = jobs_mod.start_flow_job(str(deck), convergence_info=None)  # queues
+    assert queued.state == "queued"
+
+    # Simulate a fresh process: drop the in-memory registry and reload.
+    jobs_mod._JOBS.clear()
+    jobs_mod._LOADED = False
+    jobs_mod._ensure_loaded()
+
+    reloaded = jobs_mod._JOBS[queued.job_id]
+    assert reloaded.state == "queued", "reloaded job should stay queued"
+    assert reloaded._proc is None, "reloaded job must not have been launched"
+
+
 def test_cancel_queued_job(jobs_mod, tmp_path):
     deck = tmp_path / "X.DATA"
     deck.write_text("RUNSPEC\nEND\n", encoding="utf-8")
