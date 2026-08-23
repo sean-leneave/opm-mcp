@@ -6,6 +6,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Reloaded jobs are no longer auto-launched. `_ensure_loaded()` called
+  `_pump()`, so any process importing `opm_mcp` and sharing the work directory
+  would adopt and start jobs another process had queued — two `flow` processes
+  on one `--output-dir`. Adoption is now explicit via `resume_orphaned_jobs()`.
+- Bound `mcp[cli]` below 2.0. SDK 2.0 removed `mcp.server.fastmcp` and renamed
+  `FastMCP` to `MCPServer` (`mcp.server.mcpserver`), so an unbounded
+  requirement resolved to 2.x and failed at import on a clean install.
+
+### Known follow-up
+
+- Port the server to MCP SDK 2.0 (`from mcp.server import MCPServer`) and lift
+  the `<2` bound. The decorator API is otherwise close to unchanged, so the
+  rename is most of the work.
+
 ### Added (field-feedback fixes — see FEEDBACK.md)
 
 - **`deck_text` / `deck_grep`**: host-native deck text access — numbered
