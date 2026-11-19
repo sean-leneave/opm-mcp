@@ -18,7 +18,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import wsl
+from . import guard, wsl
 from .coerce import arg_list, key_list
 from .config import SETTINGS
 from .tools import analysis as analysis_tools
@@ -72,10 +72,15 @@ def _safe(fn):
 
 
 def safe_tool(**kwargs):
-    """``@safe_tool()`` with the :func:`_safe` error contract applied."""
+    """``@safe_tool()`` with the :func:`_safe` error contract and path confinement applied.
+
+    Every argument named in :data:`guard.PATH_ARGS` must resolve inside
+    ``OPM_MCP_ROOTS``; otherwise the call returns ``{"ok": false,
+    "error_type": "PathNotAllowed"}`` without touching the filesystem.
+    """
 
     def decorator(fn):
-        return mcp.tool(**kwargs)(_safe(fn))
+        return mcp.tool(**kwargs)(_safe(guard.confine_args(fn)))
 
     return decorator
 
@@ -498,7 +503,18 @@ def resinsight_snapshot(
     force_software_gl: bool = False,
     extra_commands: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Render the default 3D view of a case in ResInsight and save a PNG snapshot."""
+    """Render the default 3D view of a case in ResInsight and save a PNG snapshot.
+
+    ``extra_commands`` (raw ResInsight command-file lines) is refused unless
+    OPM_MCP_ALLOW_RESINSIGHT_COMMANDS=1: such lines can load or export files
+    outside the allowed roots.
+    """
+    if extra_commands and not SETTINGS.allow_resinsight_commands:
+        return {
+            "ok": False,
+            "error": "extra_commands is disabled (set OPM_MCP_ALLOW_RESINSIGHT_COMMANDS=1 to enable)",
+            "error_type": "PermissionError",
+        }
     return ri_tools.export_snapshot(
         case_path,
         output_dir=output_dir,
@@ -611,8 +627,15 @@ def run_upscaling(tool: str, args: list[str] | str, cwd: str | None = None) -> d
     """Run an opm-upscaling binary (``upscale_perm``, ``upscale_relperm``, etc.) passthrough.
 
     ``args`` is a JSON array; a plain string is also accepted and split
-    shell-style.
+    shell-style. Disabled unless OPM_MCP_ENABLE_UPSCALING=1, because the
+    arguments are passed through unchecked and can name any file.
     """
+    if not SETTINGS.enable_upscaling:
+        return {
+            "ok": False,
+            "error": "run_upscaling is disabled (set OPM_MCP_ENABLE_UPSCALING=1 to enable)",
+            "error_type": "PermissionError",
+        }
     return util_tools.run_upscaling(tool, arg_list(args) or [], cwd=cwd)
 
 

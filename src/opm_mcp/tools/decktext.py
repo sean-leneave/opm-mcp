@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .. import wsl
+from .. import guard, wsl
 
 # Skip pattern-searching huge data blobs (GRDECL arrays can run to 100s of MB);
 # they're noise for keyword greps and slow to scan.
@@ -141,6 +141,10 @@ def collect_files(deck_path: str, max_files: int = 64) -> tuple[list[Path], list
         if key in seen:
             continue
         seen.add(key)
+        if not guard.is_allowed(current):
+            # An INCLUDE that points outside the allowed roots is reported, never read.
+            missing.append(f"{current} (blocked: outside allowed roots)")
+            continue
         if not current.exists():
             missing.append(str(current))
             continue
@@ -153,16 +157,20 @@ def collect_files(deck_path: str, max_files: int = 64) -> tuple[list[Path], list
 
 
 def _resolve_member(deck_path: str, file: str | None) -> Path | dict[str, Any]:
-    """Resolve ``file`` against the deck's INCLUDE tree (or return the deck)."""
+    """Resolve ``file`` against the deck's INCLUDE tree (or return the deck).
+
+    Every candidate must lie inside the allowed roots (``guard``); a ``file``
+    argument cannot be used to read arbitrary files.
+    """
     if not file:
         return _to_local(deck_path)
     cand = _to_local(file)
     if cand.exists():
-        return cand
+        return Path(guard.confine(cand, what="file"))
     if not cand.is_absolute():
         rel = _to_local(deck_path).parent / str(file)
         if rel.exists():
-            return rel
+            return Path(guard.confine(rel, what="file"))
     # Last resort: match by bare filename anywhere in the include tree.
     files, _ = collect_files(deck_path)
     wanted = Path(str(file)).name.lower()

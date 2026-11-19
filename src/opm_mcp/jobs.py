@@ -21,6 +21,17 @@ Three properties matter here:
 * **Provenance.** Each job records the flow version and the SHA-256 of the
   top-level deck, so "which deck produced this curve?" stays answerable long
   after a sensitivity study is done.
+
+Hardening in the sean-leneave fork:
+
+* **Fixed run environment.** Flow starts under ``env -i`` with a short, explicit
+  environment (``run_env``, recorded in ``job.json``) and a non-login,
+  non-interactive bash, so shell profiles cannot change a run's PATH, thread
+  counts or MPI settings between runs.
+* **Option policy.** ``extra_args`` go through :func:`guard.validate_flow_extra_args`
+  and the core budget through :func:`guard.check_cores` before anything starts.
+* **Publishing.** When ``OPM_MCP_PUBLISH`` is set, a completed job's case files,
+  log and ``job.json`` are copied to ``<publish>/<case>-<job_id>/`` for viewing.
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -39,7 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import wsl
+from . import guard, wsl
 from .config import SETTINGS
 
 _JOB_LOCK = threading.RLock()
@@ -73,7 +85,11 @@ class FlowJob:
     last_progress: Optional[str] = None
     flow_version: Optional[str] = None
     deck_sha256: Optional[str] = None
+    run_env: dict = field(default_factory=dict)
+    published_to: Optional[str] = None
+    publish_error: Optional[str] = None
     _proc: Optional[subprocess.Popen] = field(default=None, repr=False)
+    _publishing: bool = field(default=False, repr=False)
 
     def to_dict(self) -> dict:
         # ``asdict`` deepcopies, which trips over the Popen handle's internal
@@ -99,6 +115,9 @@ class FlowJob:
             "last_progress": self.last_progress,
             "flow_version": self.flow_version,
             "deck_sha256": self.deck_sha256,
+            "run_env": dict(self.run_env),
+            "published_to": self.published_to,
+            "publish_error": self.publish_error,
         }
 
     @property
@@ -152,6 +171,14 @@ def start_flow_job(
         Run distributed via ``mpirun -np N``. Requires Open MPI in the distro.
     """
     _ensure_loaded()
+    # Guardrails first: nothing is created or launched for a refused request.
+    guard.confine(deck_path, what="deck_path")
+    if output_dir:
+        guard.confine(output_dir, what="output_dir")
+    accepted_extra = guard.validate_flow_extra_args(extra_args)
+    t_check = threads if threads is not None else SETTINGS.flow_default_threads
+    guard.check_cores(mpi_processes, t_check)
+
     deck_wsl = wsl.to_wsl_path(deck_path)
     case_name = Path(deck_wsl).stem
 
@@ -172,8 +199,8 @@ def start_flow_job(
         argv.append(f"--threads-per-process={t}")
     if convergence_info and convergence_info.lower() != "none":
         argv.append(f"--output-extra-convergence-info={convergence_info}")
-    if extra_args:
-        argv.extend(extra_args)
+    if accepted_extra:
+        argv.extend(accepted_extra)
 
     deck_win = wsl.to_windows_path(deck_wsl)
     job = FlowJob(
@@ -247,7 +274,14 @@ def _launch_locked(job: FlowJob) -> None:
         f"echo $$ > {shlex.quote(pid_wsl)} && "
         f"exec {flow_cmd} > {shlex.quote(log_path_wsl)} 2>&1"
     )
-    proc = wsl.popen(["bash", "-lc", bash_line])
+    run_env = _run_environment()
+    job.run_env = run_env
+    launcher = (
+        ["env", "-i"]
+        + [f"{k}={v}" for k, v in sorted(run_env.items())]
+        + ["bash", "--noprofile", "--norc", "-c", bash_line]
+    )
+    proc = wsl.popen(launcher, stdout_path=os.devnull, merge_stderr=True)
     job._proc = proc
     job.pid = proc.pid
     job.state = "running"
@@ -279,7 +313,89 @@ def _watch(job: FlowJob) -> None:
             job.state = "failed"
             job.error = _scan_log_for_fatal(job.log_path)
         _save_metadata(job)
+    if job.state == "completed":
+        _publish(job)
     _pump()
+
+
+_BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_LINUX_HOME: str | None = None
+
+
+def _linux_home() -> str:
+    """HOME of the Linux user that runs flow (local on POSIX, queried once via WSL)."""
+    global _LINUX_HOME
+    if _LINUX_HOME is None:
+        if os.name != "nt":
+            _LINUX_HOME = os.path.expanduser("~")
+        else:
+            res = wsl.run(["sh", "-c", 'printf %s "$HOME"'], check=False, timeout=15)
+            _LINUX_HOME = res.stdout.strip() or "/tmp"
+    return _LINUX_HOME
+
+
+def _run_environment() -> dict[str, str]:
+    """The complete, explicit environment flow runs with (recorded per job).
+
+    Deliberately excludes OMP_NUM_THREADS and MPI variables: thread counts are
+    passed as flow options (``--threads-per-process``) so they appear in argv.
+    """
+    path = _BASE_PATH
+    flow_dir = os.path.dirname(SETTINGS.flow_bin) if SETTINGS.flow_bin.startswith("/") else ""
+    if flow_dir and flow_dir not in path.split(":"):
+        path = f"{flow_dir}:{path}"
+    env = {"PATH": path, "HOME": _linux_home(), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    user = os.environ.get("USER") if os.name != "nt" else None
+    if user:
+        env["USER"] = user
+    return env
+
+
+_PUBLISH_SUFFIXES = (
+    "EGRID", "INIT", "UNRST", "SMSPEC", "UNSMRY", "ESMRY", "PRT", "DBG", "RFT", "INFOSTEP", "INFOITER",
+)
+
+
+def _publish(job: FlowJob) -> None:
+    """Copy a completed job's case files, log and job.json to the publish dir.
+
+    Failures are recorded on the job (``publish_error``) and never change its
+    state: the simulation itself succeeded.
+    """
+    if SETTINGS.publish_dir is None:
+        return
+    with _JOB_LOCK:  # the watcher thread and a status poll can both get here
+        if job.published_to or job._publishing:
+            return
+        job._publishing = True
+    try:
+        src = Path(wsl.to_windows_path(job.output_dir_wsl))
+        dest = SETTINGS.publish_dir / f"{job.case_name}-{job.job_id}"
+        guard.confine(dest, what="publish destination")
+        dest.mkdir(parents=True, exist_ok=False)
+        for suffix in _PUBLISH_SUFFIXES:
+            f = src / f"{job.case_name}.{suffix}"
+            if f.is_file():
+                shutil.copy2(f, dest / f.name)
+        for extra in (Path(job.log_path), Path(job.workdir_win) / "job.json"):
+            if extra.is_file():
+                shutil.copy2(extra, dest / extra.name)
+        with _JOB_LOCK:
+            job.published_to = str(dest)
+            job.publish_error = None
+    except Exception as exc:  # noqa: BLE001 - publishing must not break the job
+        with _JOB_LOCK:
+            job.publish_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        with _JOB_LOCK:
+            job._publishing = False
+    _save_metadata(job)
+    # Refresh the published copy of job.json so it carries published_to.
+    if job.published_to:
+        try:
+            shutil.copy2(Path(job.workdir_win) / "job.json", Path(job.published_to) / "job.json")
+        except OSError:
+            pass
 
 
 def _get_flow_version() -> str | None:
@@ -375,6 +491,8 @@ def _refresh_state(job: FlowJob, alive: bool | None = None) -> None:
             if job.state == "failed":
                 job.error = _scan_log_for_fatal(job.log_path)
         _save_metadata(job)
+        if job.state == "completed":
+            _publish(job)
         _pump()
         return
     # Reloaded job (no handle): the only honest signal is whether the Linux PID
@@ -390,6 +508,8 @@ def _refresh_state(job: FlowJob, alive: bool | None = None) -> None:
         job.error = err
         job.finished_at = job.finished_at or _utcnow()
     _save_metadata(job)
+    if job.state == "completed":
+        _publish(job)
     _pump()
 
 
@@ -575,5 +695,8 @@ def _load_jobs_from_disk() -> None:
             last_progress=d.get("last_progress"),
             flow_version=d.get("flow_version"),
             deck_sha256=d.get("deck_sha256"),
+            run_env=d.get("run_env") or {},
+            published_to=d.get("published_to"),
+            publish_error=d.get("publish_error"),
         )
         _JOBS[job_id] = job

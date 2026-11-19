@@ -1,0 +1,8 @@
+# Runtime dependencies (mirrors [project].dependencies in pyproject.toml).
+# Locked with hashes in requirements.lock; regenerate with:
+#   uv pip compile requirements.in --universal --python-version 3.12 --generate-hashes -o requirements.lock
+mcp[cli]>=1.2,<2
+resdata>=4.2
+pydantic>=2.6
+numpy>=1.26
+matplotlib>=3.8

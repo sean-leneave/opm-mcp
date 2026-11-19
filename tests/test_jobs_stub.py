@@ -33,6 +33,8 @@ def jobs_mod(tmp_path, monkeypatch):
     monkeypatch.setenv("OPM_MCP_WORK_DIR", str(tmp_path / "wd"))
     monkeypatch.setenv("OPM_MCP_FLOW_BIN", str(stub))
     monkeypatch.setenv("OPM_MCP_MAX_PARALLEL", "1")
+    # Fork: path confinement is on; decks in these tests live under tmp_path.
+    monkeypatch.setenv("OPM_MCP_ROOTS", str(tmp_path))
     import opm_mcp.config as cfg
 
     importlib.reload(cfg)

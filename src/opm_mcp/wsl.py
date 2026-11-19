@@ -210,15 +210,26 @@ def popen(
     creationflags = 0
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    return subprocess.Popen(
-        cmd,
-        stdout=stdout,
-        stderr=stderr,
-        stdin=subprocess.DEVNULL,
-        creationflags=creationflags,
-        env=sub_env,
-        cwd=sub_cwd,
-    )
+    try:
+        return subprocess.Popen(
+            cmd,
+            stdout=stdout,
+            stderr=stderr,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+            # POSIX: run in its own session so a simulation is not killed when
+            # the MCP client hangs up and the server's process group receives
+            # SIGHUP/SIGTERM. (Windows uses CREATE_NEW_PROCESS_GROUP above.)
+            start_new_session=not _ON_WINDOWS,
+            env=sub_env,
+            cwd=sub_cwd,
+        )
+    finally:
+        # The child holds its own copies of the log file descriptors; close the
+        # parent's so long sessions do not leak one handle per job.
+        for fh in (stdout, stderr):
+            if hasattr(fh, "close"):
+                fh.close()
 
 
 def wsl_pid_alive(pid: int) -> bool:
