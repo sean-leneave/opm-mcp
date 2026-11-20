@@ -21,6 +21,17 @@ Three properties matter here:
 * **Provenance.** Each job records the flow version and the SHA-256 of the
   top-level deck, so "which deck produced this curve?" stays answerable long
   after a sensitivity study is done.
+
+Hardening in the sean-leneave fork:
+
+* **Fixed run environment.** Flow starts under ``env -i`` with a short, explicit
+  environment (``run_env``, recorded in ``job.json``) and a non-login,
+  non-interactive bash, so shell profiles cannot change a run's PATH, thread
+  counts or MPI settings between runs.
+* **Option policy.** ``extra_args`` go through :func:`guard.validate_flow_extra_args`
+  and the core budget through :func:`guard.check_cores` before anything starts.
+* **Publishing.** When ``OPM_MCP_PUBLISH`` is set, a completed job's case files,
+  log and ``job.json`` are copied to ``<publish>/<case>-<job_id>/`` for viewing.
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -39,7 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import wsl
+from . import guard, wsl
 from .config import SETTINGS
 
 _JOB_LOCK = threading.RLock()
@@ -66,6 +78,7 @@ class FlowJob:
     started_at: Optional[str] = None
     pid: Optional[int] = None  # Windows-side launcher PID (wsl.exe / bash)
     wsl_pid: Optional[int] = None  # Linux-side flow PID (for cross-restart kill)
+    pid_identity: Optional[str] = None  # "<boot_id>:<start_time>" of wsl_pid; survives PID reuse
     finished_at: Optional[str] = None
     returncode: Optional[int] = None
     state: str = "queued"  # queued | running | completed | failed | cancelled | unknown
@@ -73,7 +86,11 @@ class FlowJob:
     last_progress: Optional[str] = None
     flow_version: Optional[str] = None
     deck_sha256: Optional[str] = None
+    run_env: dict = field(default_factory=dict)
+    published_to: Optional[str] = None
+    publish_error: Optional[str] = None
     _proc: Optional[subprocess.Popen] = field(default=None, repr=False)
+    _publishing: bool = field(default=False, repr=False)
 
     def to_dict(self) -> dict:
         # ``asdict`` deepcopies, which trips over the Popen handle's internal
@@ -92,6 +109,7 @@ class FlowJob:
             "output_dir_wsl": self.output_dir_wsl,
             "pid": self.pid,
             "wsl_pid": self.wsl_pid,
+            "pid_identity": self.pid_identity,
             "finished_at": self.finished_at,
             "returncode": self.returncode,
             "state": self.state,
@@ -99,6 +117,9 @@ class FlowJob:
             "last_progress": self.last_progress,
             "flow_version": self.flow_version,
             "deck_sha256": self.deck_sha256,
+            "run_env": dict(self.run_env),
+            "published_to": self.published_to,
+            "publish_error": self.publish_error,
         }
 
     @property
@@ -152,6 +173,14 @@ def start_flow_job(
         Run distributed via ``mpirun -np N``. Requires Open MPI in the distro.
     """
     _ensure_loaded()
+    # Guardrails first: nothing is created or launched for a refused request.
+    guard.confine(deck_path, what="deck_path")
+    if output_dir:
+        guard.confine(output_dir, what="output_dir")
+    accepted_extra = guard.validate_flow_extra_args(extra_args)
+    t_check = threads if threads is not None else SETTINGS.flow_default_threads
+    guard.check_cores(mpi_processes, t_check)
+
     deck_wsl = wsl.to_wsl_path(deck_path)
     case_name = Path(deck_wsl).stem
 
@@ -172,8 +201,8 @@ def start_flow_job(
         argv.append(f"--threads-per-process={t}")
     if convergence_info and convergence_info.lower() != "none":
         argv.append(f"--output-extra-convergence-info={convergence_info}")
-    if extra_args:
-        argv.extend(extra_args)
+    if accepted_extra:
+        argv.extend(accepted_extra)
 
     deck_win = wsl.to_windows_path(deck_wsl)
     job = FlowJob(
@@ -247,7 +276,14 @@ def _launch_locked(job: FlowJob) -> None:
         f"echo $$ > {shlex.quote(pid_wsl)} && "
         f"exec {flow_cmd} > {shlex.quote(log_path_wsl)} 2>&1"
     )
-    proc = wsl.popen(["bash", "-lc", bash_line])
+    run_env = _run_environment()
+    job.run_env = run_env
+    launcher = (
+        ["env", "-i"]
+        + [f"{k}={v}" for k, v in sorted(run_env.items())]
+        + ["bash", "--noprofile", "--norc", "-c", bash_line]
+    )
+    proc = wsl.popen(launcher, stdout_path=os.devnull, merge_stderr=True)
     job._proc = proc
     job.pid = proc.pid
     job.state = "running"
@@ -262,6 +298,8 @@ def _watch(job: FlowJob) -> None:
         return
     if job.wsl_pid is None:
         job.wsl_pid = _read_pidfile(job.pidfile_path, timeout=5.0)
+    if job.wsl_pid is not None and job.pid_identity is None:
+        job.pid_identity = wsl.wsl_pids_identity([job.wsl_pid]).get(int(job.wsl_pid))
     if job.flow_version is None:
         job.flow_version = _get_flow_version()
     _save_metadata(job)
@@ -279,7 +317,89 @@ def _watch(job: FlowJob) -> None:
             job.state = "failed"
             job.error = _scan_log_for_fatal(job.log_path)
         _save_metadata(job)
+    if job.state == "completed":
+        _publish(job)
     _pump()
+
+
+_BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_LINUX_HOME: str | None = None
+
+
+def _linux_home() -> str:
+    """HOME of the Linux user that runs flow (local on POSIX, queried once via WSL)."""
+    global _LINUX_HOME
+    if _LINUX_HOME is None:
+        if os.name != "nt":
+            _LINUX_HOME = os.path.expanduser("~")
+        else:
+            res = wsl.run(["sh", "-c", 'printf %s "$HOME"'], check=False, timeout=15)
+            _LINUX_HOME = res.stdout.strip() or "/tmp"
+    return _LINUX_HOME
+
+
+def _run_environment() -> dict[str, str]:
+    """The complete, explicit environment flow runs with (recorded per job).
+
+    Deliberately excludes OMP_NUM_THREADS and MPI variables: thread counts are
+    passed as flow options (``--threads-per-process``) so they appear in argv.
+    """
+    path = _BASE_PATH
+    flow_dir = os.path.dirname(SETTINGS.flow_bin) if SETTINGS.flow_bin.startswith("/") else ""
+    if flow_dir and flow_dir not in path.split(":"):
+        path = f"{flow_dir}:{path}"
+    env = {"PATH": path, "HOME": _linux_home(), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    user = os.environ.get("USER") if os.name != "nt" else None
+    if user:
+        env["USER"] = user
+    return env
+
+
+_PUBLISH_SUFFIXES = (
+    "EGRID", "INIT", "UNRST", "SMSPEC", "UNSMRY", "ESMRY", "PRT", "DBG", "RFT", "INFOSTEP", "INFOITER",
+)
+
+
+def _publish(job: FlowJob) -> None:
+    """Copy a completed job's case files, log and job.json to the publish dir.
+
+    Failures are recorded on the job (``publish_error``) and never change its
+    state: the simulation itself succeeded.
+    """
+    if SETTINGS.publish_dir is None:
+        return
+    with _JOB_LOCK:  # the watcher thread and a status poll can both get here
+        if job.published_to or job._publishing:
+            return
+        job._publishing = True
+    try:
+        src = Path(wsl.to_windows_path(job.output_dir_wsl))
+        dest = SETTINGS.publish_dir / f"{job.case_name}-{job.job_id}"
+        guard.confine(dest, what="publish destination")
+        dest.mkdir(parents=True, exist_ok=False)
+        for suffix in _PUBLISH_SUFFIXES:
+            f = src / f"{job.case_name}.{suffix}"
+            if f.is_file():
+                shutil.copy2(f, dest / f.name)
+        for extra in (Path(job.log_path), Path(job.workdir_win) / "job.json"):
+            if extra.is_file():
+                shutil.copy2(extra, dest / extra.name)
+        with _JOB_LOCK:
+            job.published_to = str(dest)
+            job.publish_error = None
+    except Exception as exc:  # noqa: BLE001 - publishing must not break the job
+        with _JOB_LOCK:
+            job.publish_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        with _JOB_LOCK:
+            job._publishing = False
+    _save_metadata(job)
+    # Refresh the published copy of job.json so it carries published_to.
+    if job.published_to:
+        try:
+            shutil.copy2(Path(job.workdir_win) / "job.json", Path(job.published_to) / "job.json")
+        except OSError:
+            pass
 
 
 def _get_flow_version() -> str | None:
@@ -309,10 +429,30 @@ def _read_pidfile(path: Path, timeout: float = 5.0) -> int | None:
     return None
 
 
+# Flow ends a normal run with a timing summary (seen in Flow 2026.04 logs):
+#   "Simulation time:  202.08 s" ... "Overall Newton Iterations:  1305 ..."
+# A run killed by a reboot, OOM or SIGKILL stops mid-schedule without it.
+_END_OF_RUN_MARKERS = ("Simulation time:", "Overall Newton Iterations:")
+INTERRUPTED = (
+    "interrupted: the log ends without Flow's end-of-run summary "
+    "(host reboot, kill or crash while no server was watching)"
+)
+
+
 def _classify_finished(log_path: str) -> tuple[str, str | None]:
-    """Classify a job that finished while we weren't watching (post-restart)."""
+    """Classify a job that finished while we weren't watching (post-restart).
+
+    The exit code died with the old server, so the log decides. Success needs positive
+    evidence, Flow's end-of-run summary; the mere absence of an error line is not
+    enough, because a run killed by a reboot leaves no error behind.
+    """
     fatal = _scan_log_for_fatal(log_path)
-    return ("failed", fatal) if fatal else ("completed", None)
+    if fatal:
+        return "failed", fatal
+    tail = _read_tail(log_path, 200)
+    if all(any(line.lstrip().startswith(m) for line in tail) for m in _END_OF_RUN_MARKERS):
+        return "completed", None
+    return "failed", INTERRUPTED
 
 
 def _scan_log_for_fatal(log_path: str) -> str | None:
@@ -355,6 +495,31 @@ def queue_position(job: FlowJob) -> int | None:
     return None
 
 
+def _liveness(items: list[FlowJob]) -> dict[str, bool]:
+    """Is each job's Flow process still the one we started? (one round-trip for all)
+
+    Jobs with a recorded ``pid_identity`` are alive only if the PID exists *and* has
+    the same boot id and start time, so a reboot or PID reuse never makes a dead run
+    look alive. Jobs recorded before identities existed fall back to a bare PID check.
+    """
+    items = [j for j in items if j.wsl_pid]
+    if not items:
+        return {}
+    idents = wsl.wsl_pids_identity([j.wsl_pid for j in items])
+    out: dict[str, bool] = {}
+    legacy: list[FlowJob] = []
+    for j in items:
+        if j.pid_identity and idents:
+            out[j.job_id] = idents.get(int(j.wsl_pid)) == j.pid_identity
+        else:
+            legacy.append(j)
+    if legacy:
+        alive = wsl.wsl_pids_alive([j.wsl_pid for j in legacy])
+        for j in legacy:
+            out[j.job_id] = alive.get(int(j.wsl_pid), False)
+    return out
+
+
 def _refresh_state(job: FlowJob, alive: bool | None = None) -> None:
     """Update a job's state from its live handle or the Linux PID.
 
@@ -375,13 +540,15 @@ def _refresh_state(job: FlowJob, alive: bool | None = None) -> None:
             if job.state == "failed":
                 job.error = _scan_log_for_fatal(job.log_path)
         _save_metadata(job)
+        if job.state == "completed":
+            _publish(job)
         _pump()
         return
     # Reloaded job (no handle): the only honest signal is whether the Linux PID
     # is still alive. If it is, the run continues; if not, it finished while we
     # were down and we classify from the log (exact rc was lost with the handle).
     if job.wsl_pid is not None:
-        is_alive = alive if alive is not None else wsl.wsl_pid_alive(job.wsl_pid)
+        is_alive = alive if alive is not None else _liveness([job]).get(job.job_id, False)
         if is_alive:
             return
     state, err = _classify_finished(job.log_path)
@@ -390,6 +557,8 @@ def _refresh_state(job: FlowJob, alive: bool | None = None) -> None:
         job.error = err
         job.finished_at = job.finished_at or _utcnow()
     _save_metadata(job)
+    if job.state == "completed":
+        _publish(job)
     _pump()
 
 
@@ -400,9 +569,9 @@ def list_jobs() -> list[FlowJob]:
     # Batch the PID-liveness checks for reloaded running jobs (one WSL
     # round-trip total instead of one per job).
     need = [j for j in items if j.state == "running" and j._proc is None and j.wsl_pid]
-    alive = wsl.wsl_pids_alive([j.wsl_pid for j in need]) if need else {}
+    alive = _liveness(need)
     for job in items:
-        hint = alive.get(job.wsl_pid) if job in need else None
+        hint = alive.get(job.job_id) if job in need else None
         _refresh_state(job, alive=hint)
     return sorted(items, key=lambda j: j.created_at, reverse=True)
 
@@ -431,10 +600,12 @@ def cancel_job(job_id: str) -> FlowJob:
                 job._proc.kill()
         except Exception:
             pass
-    if job.wsl_pid is not None and wsl.wsl_pid_alive(job.wsl_pid):
+    # Only signal the PID if it is still *our* Flow: after a reboot the number may
+    # belong to an unrelated process, which must never be killed.
+    if job.wsl_pid is not None and _liveness([job]).get(job.job_id, False):
         wsl.wsl_kill(job.wsl_pid)
         time.sleep(0.5)
-        if wsl.wsl_pid_alive(job.wsl_pid):
+        if _liveness([job]).get(job.job_id, False):
             wsl.wsl_kill(job.wsl_pid, force=True)
     with _JOB_LOCK:
         job.state = "cancelled"
@@ -568,6 +739,7 @@ def _load_jobs_from_disk() -> None:
             output_dir_wsl=d.get("output_dir_wsl", ""),
             pid=d.get("pid"),
             wsl_pid=d.get("wsl_pid"),
+            pid_identity=d.get("pid_identity"),
             finished_at=d.get("finished_at"),
             returncode=d.get("returncode"),
             state=d.get("state", "unknown"),
@@ -575,5 +747,8 @@ def _load_jobs_from_disk() -> None:
             last_progress=d.get("last_progress"),
             flow_version=d.get("flow_version"),
             deck_sha256=d.get("deck_sha256"),
+            run_env=d.get("run_env") or {},
+            published_to=d.get("published_to"),
+            publish_error=d.get("publish_error"),
         )
         _JOBS[job_id] = job

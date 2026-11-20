@@ -1,0 +1,4 @@
+# Build backend for the editable install, locked so no unhashed download happens.
+# Regenerate: uv pip compile requirements-build.in --universal --python-version 3.12 --generate-hashes -o requirements-build.lock
+setuptools>=68
+wheel

@@ -210,15 +210,26 @@ def popen(
     creationflags = 0
     if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    return subprocess.Popen(
-        cmd,
-        stdout=stdout,
-        stderr=stderr,
-        stdin=subprocess.DEVNULL,
-        creationflags=creationflags,
-        env=sub_env,
-        cwd=sub_cwd,
-    )
+    try:
+        return subprocess.Popen(
+            cmd,
+            stdout=stdout,
+            stderr=stderr,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+            # POSIX: run in its own session so a simulation is not killed when
+            # the MCP client hangs up and the server's process group receives
+            # SIGHUP/SIGTERM. (Windows uses CREATE_NEW_PROCESS_GROUP above.)
+            start_new_session=not _ON_WINDOWS,
+            env=sub_env,
+            cwd=sub_cwd,
+        )
+    finally:
+        # The child holds its own copies of the log file descriptors; close the
+        # parent's so long sessions do not leak one handle per job.
+        for fh in (stdout, stderr):
+            if hasattr(fh, "close"):
+                fh.close()
 
 
 def wsl_pid_alive(pid: int) -> bool:
@@ -260,6 +271,57 @@ def wsl_pids_alive(pids: Sequence[int]) -> dict[int, bool]:
                 out[int(pid_s)] = flag == "1"
             except ValueError:
                 continue
+    return out
+
+
+_BOOT_ID = "/proc/sys/kernel/random/boot_id"
+
+
+def _local_identity(pid: int) -> str | None:
+    """``<boot_id>:<start_time>`` for a local Linux PID, or None if it does not exist."""
+    try:
+        boot = Path(_BOOT_ID).read_text().strip()
+        stat = Path(f"/proc/{int(pid)}/stat").read_text()
+    except OSError:
+        return None
+    # Field 2 (comm) may contain spaces; everything after the last ")" starts at field 3,
+    # so field 22 (starttime, clock ticks since boot) is index 19.
+    fields = stat.rsplit(")", 1)[1].split()
+    return f"{boot}:{fields[19]}" if len(fields) > 19 else None
+
+
+def pid_identities_supported() -> bool:
+    """True when process identities can be read (Linux /proc, locally or in WSL)."""
+    return _ON_WINDOWS or Path(_BOOT_ID).exists()
+
+
+def wsl_pids_identity(pids: Sequence[int]) -> dict[int, str | None]:
+    """Identity (``<boot_id>:<start_time>``) of each Linux PID; None for PIDs that do not exist.
+
+    A PID alone is not a process: after a reboot, or once a PID wraps, the same number
+    belongs to an unrelated process. Boot id plus start time is unique, so a recorded
+    identity tells a still-running Flow from a stranger that inherited its PID.
+    Returns ``{}`` where identities are unsupported (non-Linux POSIX hosts).
+    """
+    pids = [int(p) for p in pids]
+    if not pids or not pid_identities_supported():
+        return {}
+    if not _ON_WINDOWS:
+        return {p: _local_identity(p) for p in pids}
+    script = (
+        f"b=$(cat {_BOOT_ID}); for p in {' '.join(map(str, pids))}; do "
+        "if [ -r /proc/$p/stat ]; then "
+        "s=$(sed -E 's/^.*\\) //' /proc/$p/stat | cut -d' ' -f20); echo \"$p:$b:$s\"; "
+        "else echo \"$p:\"; fi; done"
+    )
+    res = run(["bash", "-c", script], check=False, timeout=15)
+    out: dict[int, str | None] = {p: None for p in pids}
+    for line in res.stdout.splitlines():
+        pid_s, _, ident = line.strip().partition(":")
+        try:
+            out[int(pid_s)] = ident or None
+        except ValueError:
+            continue
     return out
 
 

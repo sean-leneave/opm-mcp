@@ -1,0 +1,4 @@
+# Test/lint tools, locked separately so they never change runtime versions.
+-c requirements.lock
+pytest>=8
+ruff>=0.6
