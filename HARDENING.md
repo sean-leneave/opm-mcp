@@ -21,7 +21,8 @@ Upstream tests are unchanged except `tests/test_jobs_stub.py`, whose fixture now
 ```
 python3 -m venv ~/opm-mcp/.venv
 ~/opm-mcp/.venv/bin/pip install --require-hashes -r requirements.lock
-~/opm-mcp/.venv/bin/pip install --no-deps -e .
+~/opm-mcp/.venv/bin/pip install --require-hashes -r requirements-build.lock
+~/opm-mcp/.venv/bin/pip install --no-deps --no-build-isolation -e .
 ~/opm-mcp/.venv/bin/pip install --require-hashes -r requirements-dev.lock
 ~/opm-mcp/.venv/bin/pytest -q
 ```
