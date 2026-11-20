@@ -429,10 +429,30 @@ def _read_pidfile(path: Path, timeout: float = 5.0) -> int | None:
     return None
 
 
+# Flow ends a normal run with a timing summary (seen in Flow 2026.04 logs):
+#   "Simulation time:  202.08 s" ... "Overall Newton Iterations:  1305 ..."
+# A run killed by a reboot, OOM or SIGKILL stops mid-schedule without it.
+_END_OF_RUN_MARKERS = ("Simulation time:", "Overall Newton Iterations:")
+INTERRUPTED = (
+    "interrupted: the log ends without Flow's end-of-run summary "
+    "(host reboot, kill or crash while no server was watching)"
+)
+
+
 def _classify_finished(log_path: str) -> tuple[str, str | None]:
-    """Classify a job that finished while we weren't watching (post-restart)."""
+    """Classify a job that finished while we weren't watching (post-restart).
+
+    The exit code died with the old server, so the log decides. Success needs positive
+    evidence, Flow's end-of-run summary; the mere absence of an error line is not
+    enough, because a run killed by a reboot leaves no error behind.
+    """
     fatal = _scan_log_for_fatal(log_path)
-    return ("failed", fatal) if fatal else ("completed", None)
+    if fatal:
+        return "failed", fatal
+    tail = _read_tail(log_path, 200)
+    if all(any(line.lstrip().startswith(m) for line in tail) for m in _END_OF_RUN_MARKERS):
+        return "completed", None
+    return "failed", INTERRUPTED
 
 
 def _scan_log_for_fatal(log_path: str) -> str | None:

@@ -238,3 +238,55 @@ def test_dead_pid_with_identity_reads_as_finished(jobs_mod, tmp_path):
     job_id = _plant_running_job(tmp_path, gone.pid, f"{boot}:1")
     listed = {j.job_id: j for j in jobs_mod.list_jobs()}
     assert listed[job_id].state != "running"
+
+
+# --- Durability: an unwatched job is "completed" only with Flow's end-of-run summary ---
+
+FLOW_END = """Report step 247/247 at day 3312/3312, date = 01-Dec-2006
+Simulation time:              202.08 s
+  Assembly time:               53.00 s (Wasted: 0.0 s; 0.0%)
+Overall Linearizations:         1659      (Wasted:     0; 0.0%)
+Overall Newton Iterations:      1305      (Wasted:     0; 0.0%)
+Overall Linear Iterations:      2294      (Wasted:     0; 0.0%)
+"""
+
+FLOW_CUT = """Report step 11/247 at day 176/3312, date = 01-May-1998
+
+Starting time step 0, stepsize 12.5 days, at day 176/201, date = 01-May-1998
+"""
+
+
+@pytest.mark.parametrize(
+    "log, state",
+    [(FLOW_END, "completed"), (FLOW_CUT, "failed"), ("", "failed")],
+    ids=["end-of-run summary", "cut mid-run (reboot)", "empty log"],
+)
+def test_classify_unwatched_job(jobs_mod, tmp_path, log, state):
+    path = tmp_path / "flow.log"
+    path.write_text(log, encoding="utf-8")
+    got, err = jobs_mod._classify_finished(str(path))
+    assert got == state
+    if state == "failed":
+        assert err == jobs_mod.INTERRUPTED
+
+
+def test_fatal_line_still_wins(jobs_mod, tmp_path):
+    path = tmp_path / "flow.log"
+    path.write_text(FLOW_END + "Error: something broke\n", encoding="utf-8")
+    assert jobs_mod._classify_finished(str(path)) == ("failed", "Error: something broke")
+
+
+@identity_only
+def test_job_cut_by_reboot_reads_as_failed_and_is_not_published(jobs_mod, tmp_path):
+    import subprocess
+
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    job_id = _plant_running_job(tmp_path, gone.pid, f"{boot}:1")
+    (tmp_path / "wd" / "jobs" / job_id / "flow.log").write_text(FLOW_CUT, encoding="utf-8")
+    job = {j.job_id: j for j in jobs_mod.list_jobs()}[job_id]
+    assert job.state == "failed"
+    assert job.error == jobs_mod.INTERRUPTED
+    assert job.published_to is None
+    assert not (tmp_path / "pub").exists() or not any((tmp_path / "pub").iterdir())
