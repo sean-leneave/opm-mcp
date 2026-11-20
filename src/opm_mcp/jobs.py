@@ -78,6 +78,7 @@ class FlowJob:
     started_at: Optional[str] = None
     pid: Optional[int] = None  # Windows-side launcher PID (wsl.exe / bash)
     wsl_pid: Optional[int] = None  # Linux-side flow PID (for cross-restart kill)
+    pid_identity: Optional[str] = None  # "<boot_id>:<start_time>" of wsl_pid; survives PID reuse
     finished_at: Optional[str] = None
     returncode: Optional[int] = None
     state: str = "queued"  # queued | running | completed | failed | cancelled | unknown
@@ -108,6 +109,7 @@ class FlowJob:
             "output_dir_wsl": self.output_dir_wsl,
             "pid": self.pid,
             "wsl_pid": self.wsl_pid,
+            "pid_identity": self.pid_identity,
             "finished_at": self.finished_at,
             "returncode": self.returncode,
             "state": self.state,
@@ -296,6 +298,8 @@ def _watch(job: FlowJob) -> None:
         return
     if job.wsl_pid is None:
         job.wsl_pid = _read_pidfile(job.pidfile_path, timeout=5.0)
+    if job.wsl_pid is not None and job.pid_identity is None:
+        job.pid_identity = wsl.wsl_pids_identity([job.wsl_pid]).get(int(job.wsl_pid))
     if job.flow_version is None:
         job.flow_version = _get_flow_version()
     _save_metadata(job)
@@ -471,6 +475,31 @@ def queue_position(job: FlowJob) -> int | None:
     return None
 
 
+def _liveness(items: list[FlowJob]) -> dict[str, bool]:
+    """Is each job's Flow process still the one we started? (one round-trip for all)
+
+    Jobs with a recorded ``pid_identity`` are alive only if the PID exists *and* has
+    the same boot id and start time, so a reboot or PID reuse never makes a dead run
+    look alive. Jobs recorded before identities existed fall back to a bare PID check.
+    """
+    items = [j for j in items if j.wsl_pid]
+    if not items:
+        return {}
+    idents = wsl.wsl_pids_identity([j.wsl_pid for j in items])
+    out: dict[str, bool] = {}
+    legacy: list[FlowJob] = []
+    for j in items:
+        if j.pid_identity and idents:
+            out[j.job_id] = idents.get(int(j.wsl_pid)) == j.pid_identity
+        else:
+            legacy.append(j)
+    if legacy:
+        alive = wsl.wsl_pids_alive([j.wsl_pid for j in legacy])
+        for j in legacy:
+            out[j.job_id] = alive.get(int(j.wsl_pid), False)
+    return out
+
+
 def _refresh_state(job: FlowJob, alive: bool | None = None) -> None:
     """Update a job's state from its live handle or the Linux PID.
 
@@ -499,7 +528,7 @@ def _refresh_state(job: FlowJob, alive: bool | None = None) -> None:
     # is still alive. If it is, the run continues; if not, it finished while we
     # were down and we classify from the log (exact rc was lost with the handle).
     if job.wsl_pid is not None:
-        is_alive = alive if alive is not None else wsl.wsl_pid_alive(job.wsl_pid)
+        is_alive = alive if alive is not None else _liveness([job]).get(job.job_id, False)
         if is_alive:
             return
     state, err = _classify_finished(job.log_path)
@@ -520,9 +549,9 @@ def list_jobs() -> list[FlowJob]:
     # Batch the PID-liveness checks for reloaded running jobs (one WSL
     # round-trip total instead of one per job).
     need = [j for j in items if j.state == "running" and j._proc is None and j.wsl_pid]
-    alive = wsl.wsl_pids_alive([j.wsl_pid for j in need]) if need else {}
+    alive = _liveness(need)
     for job in items:
-        hint = alive.get(job.wsl_pid) if job in need else None
+        hint = alive.get(job.job_id) if job in need else None
         _refresh_state(job, alive=hint)
     return sorted(items, key=lambda j: j.created_at, reverse=True)
 
@@ -551,10 +580,12 @@ def cancel_job(job_id: str) -> FlowJob:
                 job._proc.kill()
         except Exception:
             pass
-    if job.wsl_pid is not None and wsl.wsl_pid_alive(job.wsl_pid):
+    # Only signal the PID if it is still *our* Flow: after a reboot the number may
+    # belong to an unrelated process, which must never be killed.
+    if job.wsl_pid is not None and _liveness([job]).get(job.job_id, False):
         wsl.wsl_kill(job.wsl_pid)
         time.sleep(0.5)
-        if wsl.wsl_pid_alive(job.wsl_pid):
+        if _liveness([job]).get(job.job_id, False):
             wsl.wsl_kill(job.wsl_pid, force=True)
     with _JOB_LOCK:
         job.state = "cancelled"
@@ -688,6 +719,7 @@ def _load_jobs_from_disk() -> None:
             output_dir_wsl=d.get("output_dir_wsl", ""),
             pid=d.get("pid"),
             wsl_pid=d.get("wsl_pid"),
+            pid_identity=d.get("pid_identity"),
             finished_at=d.get("finished_at"),
             returncode=d.get("returncode"),
             state=d.get("state", "unknown"),

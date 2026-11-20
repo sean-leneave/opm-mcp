@@ -145,3 +145,96 @@ def test_accepted_extra_args_are_recorded(jobs_mod, tmp_path):
     _wait(jobs_mod, job.job_id)
     meta = json.loads((Path(job.workdir_win) / "job.json").read_text())
     assert "--enable-tuning=true" in meta["argv"]
+
+
+# --- Durability: PID identity (boot id + start time) -------------------------
+# After a reboot or PID wrap, a recorded PID may belong to an unrelated process.
+# A job must then read as finished (never "running" forever), and cancel must not
+# signal the stranger.
+
+identity_only = pytest.mark.skipif(
+    not Path("/proc/sys/kernel/random/boot_id").exists(), reason="needs Linux /proc"
+)
+
+
+def _plant_running_job(tmp_path: Path, pid: int, identity: str | None) -> str:
+    job_id = "planted0001"
+    wd = tmp_path / "wd" / "jobs" / job_id
+    wd.mkdir(parents=True)
+    (wd / "flow.log").write_text("stub flow starting\n", encoding="utf-8")
+    meta = {
+        "job_id": job_id,
+        "deck_path_win": str(tmp_path / "models" / "CASE1.DATA"),
+        "deck_path_wsl": str(tmp_path / "models" / "CASE1.DATA"),
+        "case_name": "CASE1",
+        "workdir_win": str(wd),
+        "workdir_wsl": str(wd),
+        "argv": ["flow", "CASE1.DATA"],
+        "log_path": str(wd / "flow.log"),
+        "created_at": "2026-11-20T00:00:00+00:00",
+        "started_at": "2026-11-20T00:00:00+00:00",
+        "output_dir_wsl": str(wd / "out"),
+        "wsl_pid": pid,
+        "pid_identity": identity,
+        "state": "running",
+    }
+    (wd / "job.json").write_text(json.dumps(meta), encoding="utf-8")
+    return job_id
+
+
+@identity_only
+def test_pid_identity_is_recorded(jobs_mod, tmp_path):
+    job = jobs_mod.start_flow_job(str(_deck(tmp_path)), convergence_info=None)
+    done = _wait(jobs_mod, job.job_id)
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    meta = json.loads((Path(done.workdir_win) / "job.json").read_text())
+    assert meta["pid_identity"] and meta["pid_identity"].startswith(boot + ":")
+
+
+@identity_only
+def test_reused_pid_reads_as_finished_and_is_not_killed(jobs_mod, tmp_path):
+    import subprocess
+
+    stranger = subprocess.Popen(["sleep", "30"])
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        job_id = _plant_running_job(tmp_path, stranger.pid, f"{boot}:1")  # wrong start time
+        listed = {j.job_id: j for j in jobs_mod.list_jobs()}
+        assert listed[job_id].state != "running"
+        jobs_mod.cancel_job(job_id)
+        time.sleep(0.7)
+        assert stranger.poll() is None, "cancel must not signal a process that merely reuses the PID"
+    finally:
+        stranger.kill()
+        stranger.wait()
+
+
+@identity_only
+def test_matching_identity_stays_running_and_cancel_stops_it(jobs_mod, tmp_path):
+    import subprocess
+
+    ours = subprocess.Popen(["sleep", "30"])
+    try:
+        ident = jobs_mod.wsl.wsl_pids_identity([ours.pid])[ours.pid]
+        assert ident
+        job_id = _plant_running_job(tmp_path, ours.pid, ident)
+        listed = {j.job_id: j for j in jobs_mod.list_jobs()}
+        assert listed[job_id].state == "running"
+        assert jobs_mod.cancel_job(job_id).state == "cancelled"
+        ours.wait(timeout=5)
+    finally:
+        if ours.poll() is None:
+            ours.kill()
+            ours.wait()
+
+
+@identity_only
+def test_dead_pid_with_identity_reads_as_finished(jobs_mod, tmp_path):
+    import subprocess
+
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    job_id = _plant_running_job(tmp_path, gone.pid, f"{boot}:1")
+    listed = {j.job_id: j for j in jobs_mod.list_jobs()}
+    assert listed[job_id].state != "running"
