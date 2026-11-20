@@ -38,4 +38,10 @@ python3 -m venv ~/opm-mcp/.venv
 
 ## Status
 
-Written 2026-11-19. Not yet executed: the first test run happens in the Ubuntu VM. Do not merge to `main` until the suite passes there.
+Executed 2026-11-20 in the Mac VM (`opm-vm`, Ubuntu 24.04.5 arm64, Flow 2026.04, Python 3.12.3, resdata 7.0.0, mcp 1.30.0), installed from the hashed locks:
+
+- `pytest`: 104 passed, 1 skipped (`test_paths.py`: Windows path conversion, a no-op on POSIX).
+- End-to-end through a real MCP stdio client (`res-engr-lab/acceptance/mcp_e2e.py`): 24 of 24 (security S1–S8, accuracy A1–A6, MPI M1, durability D1–D7).
+- Reboot test: a Norne run cut by a VM reboot reads as `failed` (interrupted), is not published, and no job is left `running` (5 of 5).
+
+Fixes 7 and 8 came out of that testing.
